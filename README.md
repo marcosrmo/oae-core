@@ -30,17 +30,50 @@ npm test                 # 22 deterministic unit tests (no provider calls)
 npm run test:integration  # 1 real end-to-end test against the live service
 ```
 
+### Global install (`oae` command)
+
+The CLI is a single TypeScript entrypoint with no build step — it requires
+**Node ≥ 24** (native type-stripping) and installs globally as `oae`.
+
+From a clone:
+
+```pwsh
+git clone <repo-url>
+cd opencode-autonomous-engineering
+npm install -g .
+```
+
+From a tarball (no clone needed):
+
+```pwsh
+npm pack    # produces opencode-autonomous-engineering-0.1.0.tgz
+npm install -g opencode-autonomous-engineering-0.1.0.tgz
+```
+
+For development with live edits, link the clone instead:
+
+```pwsh
+npm link      # in the clone; makes `oae` point at your working copy
+npm unlink -g opencode-autonomous-engineering   # when done
+```
+
+The npm tarball ships only what the installed CLI needs (`src/`, `skills/`,
+plus `README.md` and `package.json`), so nothing else has to be present.
+
 ## Usage
 
 ```pwsh
-# inside any target project directory
-node <path-to-oae>/src/index.ts init   --dir .      # install .opencode/skills + reviewer agent
-node <path-to-oae>/src/index.ts run    --dir . "add a sub() function with a test"
-node <path-to-oae>/src/index.ts plan   --dir . "..."   # plan only (dry run)
-node <path-to-oae>/src/index.ts status --dir .
-node <path-to-oae>/src/index.ts report --dir .         # evidence-based final report
-node <path-to-oae>/src/index.ts publish --dir .        # requires explicit authorization
+# inside any target project directory (global install)
+oae init   --dir .      # install .opencode/skills + reviewer agent
+oae run    --dir . "add a sub() function with a test"
+oae plan   --dir . "..."   # plan only (dry run)
+oae status --dir .
+oae report --dir .         # evidence-based final report
+oae publish --dir .        # requires explicit authorization
 ```
+
+From a checkout (no global install needed), the same commands work via node
+directly: `node src/index.ts status --dir .` etc.
 
 Useful flags: `--model providerID/modelID` (default: service default model),
 `--dry-run`, `--concurrency N` (parallel tasks, default 1), `--force`
