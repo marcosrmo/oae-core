@@ -344,3 +344,29 @@ gained from live runs are unchanged and complete:
   2/3 times (nondeterministic instruction-following); the same model
   later returned 429 for ~4h+. Both are data about the *provider*, not
   the OAE loop.
+
+## 8. Observability mission stage log (2026-10-16)
+
+Per-stage status. Classification: [impl] code exists in the repo; [test]
+covered by a deterministic unit test; [live] validated against the real
+running service (read-only probes only — no provider benchmark was
+relaunched after the D15 429 incident).
+
+| # | Stage | Status |
+|---|---|---|
+| 1 | stage 1 instrumentation: typed events, agent lifecycle, provider-error classification | [impl][test] 45/45 |
+| 2 | RunView projection (phases, stall detection, token provenance) | [impl][test] |
+| 3 | deterministic dashboard renderer (TTY/CI-safe) | [impl][test] |
+| 4 | run history + archive; `oae dashboard` / `oae history`; `status` unchanged | [impl][test] + smoke on the real preserved run (snapshot + follow derived `sem progresso detectavel`) |
+| 5 | provider gates: HTTP 429/401 zero-token retries preserve the attempt budget; exhausted gates block explicitly | [impl][test] |
+| 6 | runner SSE-first (incremental events, reconnect budget, polling fallback, live usage) | [impl][test]; [live] only the event subscription itself was probed on the running service |
+| 7 | this section + DECISIONS.md D16 | [impl] |
+
+Closes §6-B partially: SSE subscription and real progress signals are in;
+what remains OPEN from §6: per-attempt turn caps with partial-output
+salvage, reusable-context caching (§6-A), per-agent model selection and
+review-on-risk (§6-C). No measured token/latency savings are claimed:
+§7's before/after benchmarks remain invalid by the provider rate-limit
+incident; the observable proxies are structural (context polls per attempt
+5s-loop → watchdog/event-driven; service calls during a long attempt:
+context ~12/h → active() ~2/h probe + zero transcription fetches).

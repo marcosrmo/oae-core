@@ -170,3 +170,77 @@ supersede older ones; superseded entries are kept for context.
   future work (EFFICIENCY_AUDIT §6). Not implemented without a
   reproducible test. Benchmarking was deliberately stopped after the
   second confirmation.
+
+## D16 — Operational observability: typed events, deterministic panel, SSE-first runner (2026-10-16)
+
+Delivers the observability mission (stages 1–6; stage 7 = this decision +
+EFFICIENCY_AUDIT §8). Motivation: §3 "No telemetry" — a run could only be
+understood by re-reading JSON manually, and §2.4's polling loop fetched the
+full session context every 5 s per attempt.
+
+**A. Typed event layer (additive, never rewritten).** `src/events.ts` names the
+event kinds; new events (`attempt_finished`, `agent_progress`,
+`retry_scheduled`, `session_interrupted`, `provider_error`) extend
+`events.jsonl` WITHOUT renaming historical kinds — older logs stay readable,
+and no migration exists to get wrong. A real payload collision was found and
+fixed at the emit sites: `Store.event` spreads data over the line, so nested
+`kind` fields (attempt kind, progress-signal kind) silently overwrote the
+event-type field → renamed `attemptKind` / `signalKind`. Provider failures are
+classified by stable markers (`classifyProviderFailure`), with confirmed-zero
+tokens kept distinct from unknown usage.
+
+**B. Deterministic projection + panel (no LLM, no observer agent).**
+`viewmodel.ts` projects `state.json` + `events.jsonl` → `RunView` with
+operational phases (inicializando … concluída/falhou), stall detection, and
+token provenance rules (zero-confirmed vs unknown; legacy runs fall back to
+the latest event labeled as weaker evidence). `dashboard.ts` renders it from
+templates: ANSI only for a real TTY, width-capped, alerts from real events.
+A still-open attempt is NOT proof of work: past the stall threshold the phase
+becomes "sem progresso detectável". Alternatives explicitly rejected per the
+mission's own constraints (§4-G): an LLM-summary observer agent (token
+consumer — the exact failure mode audited in §2.4) and panels fed by repeated
+service transcription queries.
+
+**C. History preservation.** `Store.create` used to blindly overwrite
+`.oae/state.json`; now a NEW run archives the previous `state.json` +
+`events.jsonl` into `.oae/history/<runId>/` (copy-based, idempotent) and
+resumes only the same runId. `oae history` lists current + archived runs with
+provider 429/401 counts. `oae status` output is unchanged for scripts.
+
+**D. SSE-first runner with reconnect and polling fallback.** Verified live
+that `@opencode/client` 2.0.29 exposes `client.event.subscribe()` (SSE over
+GET /api/event). `awaitCompletion` consumes the stream incrementally for its
+session only (strict sessionID filter): `session.idle`/`status idle`/
+`execution.succeeded` settle; `execution.failed` surfaces the provider error
+with its HTTP status; service retries are observability signals, deduped by
+attempt+message; step/tool events generate progress signals; text deltas are
+deliberately NOT consumed (event storm); `usage.updated` carries token usage
+so `usage()` skips a redundant `session.get`. Reconnect budget: 5, 100 ms
+pause; an unavailable subscription falls back IMMEDIATELY to the verbatim
+polling loop with the remaining deadline (indisponibility ≠ transport error);
+deadline expiry still interrupts to avoid orphan tokens. The transcript
+decides failure vs completion exactly once (`settle`), identical semantics in
+both modes — no attempt duplication, no lost final output.
+
+**E. Orchestator authority over the attempt budget.** Provider gates
+(`maxProviderRetries` default 3, `providerBackoffMs` default 30 s doubling to
+a 120 s cap): an HTTP 429/401 failure with zero confirmed tokens is
+re-classified `provider_retry` (new Attempt kind, excluded from
+`codeAttempts`) — an engineering attempt is NOT consumed, closes D15's
+recorded future work; gates exhausted → task blocked "provider unavailable
+after N provider retries — engineering attempts preserved"; a 429 AFTER real
+compute (500 confirmed tokens) falls back to the normal engineering path.
+Events: `provider_error` + `retry_scheduled` with `providerRetry` counters.
+
+**F. Trade-offs / limitations (documented, not worked around silently).**
+(1) SSE is live-only: a missed event while disconnected is not replayed —
+recovered by the `session.active()` ground-truth probe at (re)connect plus
+the watchdog; (2) progress is SELECTIVE: only material lifecycle events
+(steps, tools, retries, usage) — in-progress tool silence looks like no
+signal until the next event, and the supervisor's stall verdict remains
+time-based; (3) service retry counting from events is informational only;
+(4) dashboard `--follow` polls the local .oae files at 1 s, never the
+service; (5) real-run validation classified in EFFICIENCY_AUDIT §8 — SSE
+feasibility was probed live on the running service (read-only), but runner
+behavior under live runs is so far unit-verified only, deliberately: no
+provider benchmarks were to be relaunched after the 429 incident (D15).
