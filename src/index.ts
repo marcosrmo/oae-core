@@ -16,6 +16,7 @@
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { sleep } from "./util.ts";
 import { loadConfig, defaultConfig } from "./config.ts";
 import { Store } from "./store.ts";
 import { Orchestrator, type RunOptions } from "./orchestrator.ts";
@@ -136,7 +137,12 @@ async function main(): Promise<number> {
           break firstRun;
         }
         // follow mode: refresh only on change (no busy repaints), poll the
-        // local .oae files at 1s — never the OpenCode service, never an LLM
+        // local .oae files at 1s — never the OpenCode service, never an LLM.
+        // The wait is a plain sleep: NO signal listeners are registered here
+        // (a per-iteration SIGINT handler registration used to leak ~1
+        // listener/second and swallowed Ctrl+C) — Ctrl+C keeps Node's default
+        // behavior and terminates the process; the .oae state is never
+        // touched by that.
         process.stdout.write("\x1b[2J\x1b[H");
         let lastRender = "";
         for (;;) {
@@ -152,7 +158,7 @@ async function main(): Promise<number> {
               return v.status === "done" ? 0 : 1;
             }
           }
-          await new Promise((r) => { const t = setTimeout(r, 1000); if (process.stdin.isTTY) { const onSig = () => { clearTimeout(t); r(null); }; process.once("SIGINT", onSig); } });
+          await sleep(1000);
         }
       }
       return 0;

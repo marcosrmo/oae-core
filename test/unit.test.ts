@@ -22,6 +22,7 @@ import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type 
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
 import { listRunHistory } from "../src/history.ts";
+import { sleep } from "../src/util.ts";
 
 /** Minimal stub of the OpenCode service client for OpenCodeRunner tests. */
 function stubClient(over: Record<string, unknown> = {}, counters: { interrupt?: number; context?: number } = {}): Client {
@@ -1339,6 +1340,26 @@ test("runner SSE: usage captured from session.usage.updated without a redundant 
   assert.deepEqual(usage, { input: 7, output: 9, reasoning: 2, cacheRead: 4, cacheWrite: 1, cost: 0.25 },
     "live usage event wins over a redundant per-attempt session.get");
   assert.equal(counters.get ?? 0, 0, "no session.get round-trip when the event already carried usage");
+});
+
+test("dashboard follow loop registers NO SIGINT listeners across 15 cycles (leak regression) — Ctrl+C keeps Node default termination", async () => {
+  // The follow-mode wait is the same sleep the loop uses; the historical
+  // regression (run-mvazafl3 forensics) registered process.once("SIGINT")
+  // once per 1s iteration, leaking ~1 listener/second and swallowing Ctrl+C.
+  const before = process.listenerCount("SIGINT");
+  for (let i = 0; i < 15; i++) await sleep(1); // 15 follow-loop cycles
+  assert.equal(process.listenerCount("SIGINT"), before,
+    "running 15 follow cycles must not grow the SIGINT listener count");
+  // Static guard: the leaked pattern must not return anywhere in the CLI
+  // source. With zero SIGINT listeners in the dashboard process, Ctrl+C
+  // termination is Node's default — guaranteed by semantics, not by us.
+  // (Cross-process SIGINT delivery is not reliable on Windows, so an
+  // end-to-end Ctrl+C subprocess test would be flaky — documented, not faked.)
+  const cli = await readFile(join("src", "index.ts"), "utf8");
+  assert.equal(cli.includes('process.once("SIGINT"'), false,
+    "per-iteration SIGINT registration reintroduced in src/index.ts");
+  assert.equal(cli.includes('process.on("SIGINT"'), false,
+    "global SIGINT handler reintroduced in src/index.ts");
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {
