@@ -262,6 +262,11 @@ export class Orchestrator {
     return { runner, prompt };
   }
 
+  private async collectUsage(runner: AgentRunner): Promise<import("./opencode.ts").SessionUsage | null> {
+    if (!runner.usage) return null;
+    try { return await runner.usage(); } catch { return null; }
+  }
+
   private async executeTask(task: Task): Promise<void> {
     const cfg = this.opts.config;
     const taskStart = Date.now();
@@ -286,10 +291,12 @@ export class Orchestrator {
         startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
       });
       const res = await runner.awaitCompletion(cfg.recovery.taskTimeoutMs - (Date.now() - taskStart), (s) => this.supervisor.noteSignal(task.id, s));
+      const usage = await this.collectUsage(runner);
       await this.store.finishAttempt(task.id, attempt.id, {
         outcome: res.outcome === "completed" ? "completed" : "interrupted",
         summary: truncate(res.output, 1000),
         filesChanged: await changedFiles(cfg.projectDir, this.baselineUncommitted),
+        evidence: usage ? { tokens: JSON.stringify(usage) } : {},
       });
       if (res.outcome !== "completed") {
         // supervisor recovery: sweep already produced refined instructions
@@ -298,6 +305,22 @@ export class Orchestrator {
         this.recoveryContext.delete(task.id);
         if (codeAttempts + 1 >= cfg.recovery.maxAttempts) {
           await this.store.updateTask(task.id, { status: "blocked", blockedReason: `attempt limit (${cfg.recovery.maxAttempts}) reached` });
+          this.supervisor.unregister(task.id);
+          return;
+        }
+        await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        continue;
+      }
+      if (!res.output.trim()) {
+        // a "completed" session with no assistant text is a dispatch/provider
+        // failure, not a code change — never send an empty attempt to review
+        await this.store.decide({
+          by: "orchestrator", kind: "technical",
+          text: `Task ${task.id} attempt ${attemptNo} produced an empty response`,
+          rationale: "treated as a failed dispatch (no reviewer session spent); bounded by the attempt limit",
+        });
+        if (codeAttempts + 1 >= cfg.recovery.maxAttempts) {
+          await this.store.updateTask(task.id, { status: "blocked", blockedReason: `attempt limit (${cfg.recovery.maxAttempts}) reached (empty responses)` });
           this.supervisor.unregister(task.id);
           return;
         }
@@ -328,10 +351,15 @@ export class Orchestrator {
       });
       const revRes = await rev.runner.awaitCompletion(5 * 60_000);
       const verdict = parseVerdict(revRes.output);
+      const revUsage = await this.collectUsage(rev.runner);
       await this.store.finishAttempt(task.id, revAttempt.id, {
         outcome: verdict?.verdict === "approve" ? "approved" : "rejected",
         summary: verdict?.summary ?? truncate(revRes.output, 500),
-        evidence: { verdict: verdict?.verdict ?? "unparseable", findings: JSON.stringify(verdict?.findings ?? []) },
+        evidence: {
+          verdict: verdict?.verdict ?? "unparseable",
+          findings: JSON.stringify(verdict?.findings ?? []),
+          ...(revUsage ? { tokens: JSON.stringify(revUsage) } : {}),
+        },
       });
       if (!validatorOk || verdict?.verdict !== "approve") {
         refined = [

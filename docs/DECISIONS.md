@@ -112,3 +112,21 @@ supersede older ones; superseded entries are kept for context.
   same-directory case (the realistic recursion vector: a coder session
   shelling out in its own project) deterministically refused while the outer
   run is alive. Cross-directory recursion is bounded by layer 4.
+
+## D14 — Efficiency fixes from the 2026-10-16 loop audit (docs/EFFICIENCY_AUDIT.md)
+- **Decision:** five small, evidence-backed fixes; the bigger architecture
+  (SSE, per-agent models, turn caps, resume) is documented as a proposal only.
+  1. Deadline expiry now *interrupts* the session — an abandoned planner had
+     run 9 extra minutes as an orphan producing a plan nobody read.
+  2. `finalOutput` truncation raised 4,000 → 20,000 chars — a valid 4,014-char
+     plan JSON was being destroyed by 14 characters, silently forcing the
+     deterministic fallback in 2/2 real runs.
+  3. `start()` awaits the session prompt: dispatch failures (e.g. provider
+     402) surface immediately instead of as empty "completed" attempts.
+  4. Empty coder output is treated as a failed attempt (recorded, retried,
+     never sent to review) and bounded by maxAttempts.
+  5. Per-attempt token telemetry (`GET /api/session/{id}`) recorded in
+     `attempt.evidence.tokens`; completion fetches the transcript once; poll
+     interval 5s.
+- **Rationale:** every fix maps to a measured failure mode in
+  docs/EFFICIENCY_AUDIT.md; each is covered by a dedicated unit test.

@@ -23,6 +23,16 @@ export interface ProgressSignal {
   detail: string;
 }
 
+/** Token/cost usage of one session, as reported by the service (GET /api/session/{id}). */
+export interface SessionUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number | null;
+}
+
 export interface AgentRunResult {
   outcome: "completed" | "interrupted" | "failed";
   output: string;      // final assistant text
@@ -63,6 +73,8 @@ export interface AgentRunner {
   awaitCompletion(timeoutMs: number, onProgress?: (s: ProgressSignal) => void): Promise<AgentRunResult>;
   interrupt(): Promise<void>;
   transcriptTail(maxMessages: number): Promise<string>;
+  /** Token/cost usage as reported by the service; null when unavailable. */
+  usage?(): Promise<SessionUsage | null>;
 }
 
 export class OpenCodeRunner implements AgentRunner {
@@ -71,6 +83,8 @@ export class OpenCodeRunner implements AgentRunner {
   private signals: ProgressSignal[] = [];
   private interrupted = false;
   private lastCtxKey = "";
+  /** Last observed message list — reused at completion so the final context is fetched once. */
+  private lastCtx: CtxMessage[] | null = null;
 
   private constructor(sessionId: string, client: Client) {
     this.sessionId = sessionId;
@@ -94,8 +108,9 @@ export class OpenCodeRunner implements AgentRunner {
       location: { directory: opts.directory },
     });
     const runner = new OpenCodeRunner(session.id, client);
-    // prompt triggers the agent run; failure surfaces on the poll loop
-    void client.session.prompt({ sessionID: session.id, text: opts.promptText }).catch(() => undefined);
+    // awaited: a rejected prompt (provider/auth error) surfaces immediately
+    // instead of surfacing later as an empty "completed" attempt
+    await client.session.prompt({ sessionID: session.id, text: opts.promptText });
     return runner;
   }
 
@@ -110,7 +125,7 @@ export class OpenCodeRunner implements AgentRunner {
     const deadline = Date.now() + timeoutMs;
     try {
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2_500));
+        await new Promise((r) => setTimeout(r, 5_000));
         await this.observe(onProgress);
         if (this.interrupted) break;
         const active = (await this.client.session.active()) as unknown as Record<string, unknown>;
@@ -130,6 +145,10 @@ export class OpenCodeRunner implements AgentRunner {
           };
         }
       }
+      // deadline expired: stop the session too — otherwise it keeps running
+      // (and consuming tokens) as an orphan nobody reads (audit 2026-10-16:
+      // a planner session ran 9 extra minutes after being abandoned)
+      await this.interrupt();
       return { outcome: "interrupted", output: await this.finalOutput(), signals: this.signals };
     } catch (e) {
       return { outcome: "failed", output: `runner error: ${(e as Error).message}`, signals: this.signals };
@@ -141,6 +160,7 @@ export class OpenCodeRunner implements AgentRunner {
     try {
       const raw = await this.client.session.context({ sessionID: this.sessionId }) as unknown;
       const msgs = msgList(raw);
+      this.lastCtx = msgs;
       const last = msgs[msgs.length - 1];
       const tools = toolNames(last ?? {});
       const key = `${msgs.length}:${last?.id ?? ""}`;
@@ -157,10 +177,22 @@ export class OpenCodeRunner implements AgentRunner {
     } catch { /* transient transport errors: the next poll re-checks */ }
   }
 
+  /** Latest known message list (cached from observe; fetched once if never observed). */
+  private async messages(): Promise<CtxMessage[]> {
+    if (this.lastCtx) return this.lastCtx;
+    try {
+      const raw = await this.client.session.context({ sessionID: this.sessionId }) as unknown;
+      this.lastCtx = msgList(raw);
+      return this.lastCtx;
+    } catch {
+      return [];
+    }
+  }
+
   /** The service appends an "idle" message whose outcome may be "failed". */
   private async idleOutcomeFailed(): Promise<string | null> {
     try {
-      const msgs = msgList(await this.client.session.context({ sessionID: this.sessionId }) as unknown);
+      const msgs = await this.messages();
       const idle = msgs.filter((m) => role(m) === "idle").at(-1);
       if (idle && (idle as { outcome?: string }).outcome === "failed") {
         return idle.error?.message ?? "unknown failure";
@@ -173,11 +205,34 @@ export class OpenCodeRunner implements AgentRunner {
 
   private async finalOutput(): Promise<string> {
     try {
-      const msgs = msgList(await this.client.session.context({ sessionID: this.sessionId }) as unknown);
+      const msgs = await this.messages();
       const assistants = msgs.filter((m) => role(m) === "assistant" && text(m));
-      return truncate(text(assistants[assistants.length - 1] ?? {}), 4000);
+      // generous bound: a valid model plan JSON measured 4014 chars and was
+      // being destroyed by a 4000-char truncation (audit 2026-10-16);
+      // attempt summaries are truncated separately by the orchestrator
+      return truncate(text(assistants[assistants.length - 1] ?? {}), 20_000);
     } catch {
       return "";
+    }
+  }
+
+  /** Token/cost usage of this session as reported by the service (per-attempt telemetry). */
+  async usage(): Promise<SessionUsage | null> {
+    try {
+      const info = await this.client.session.get({ sessionID: this.sessionId }) as unknown as {
+        tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
+        cost?: number;
+      };
+      return {
+        input: info.tokens?.input ?? 0,
+        output: info.tokens?.output ?? 0,
+        reasoning: info.tokens?.reasoning ?? 0,
+        cacheRead: info.tokens?.cache?.read ?? 0,
+        cacheWrite: info.tokens?.cache?.write ?? 0,
+        cost: typeof info.cost === "number" ? info.cost : null,
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -188,7 +243,7 @@ export class OpenCodeRunner implements AgentRunner {
 
   async transcriptTail(maxMessages: number): Promise<string> {
     try {
-      const msgs = msgList(await this.client.session.context({ sessionID: this.sessionId }) as unknown);
+      const msgs = await this.messages();
       return msgs
         .filter((m) => text(m))
         .slice(-maxMessages)

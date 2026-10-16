@@ -17,6 +17,21 @@ import { renderReport } from "../src/report.ts";
 import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock } from "../src/runlock.ts";
+import { OpenCodeRunner, type Client, type SessionUsage } from "../src/opencode.ts";
+
+/** Minimal stub of the OpenCode service client for OpenCodeRunner tests. */
+function stubClient(over: Record<string, unknown> = {}, counters: { interrupt?: number; context?: number } = {}): Client {
+  const session = {
+    create: async () => ({ id: "ses_stub" }),
+    prompt: async () => ({}),
+    active: async () => ({ ses_stub: { type: "running" } }),
+    context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [] }; },
+    interrupt: async () => { counters.interrupt = (counters.interrupt ?? 0) + 1; },
+    get: async () => ({ tokens: { input: 1, output: 2, reasoning: 3, cache: { read: 4, write: 0 } }, cost: 0 }),
+    ...over,
+  };
+  return { session } as unknown as Client;
+}
 
 async function makeProject(): Promise<string> {
   return mkdtemp(join(tmpdir(), "oae-unit-"));
@@ -456,6 +471,124 @@ test("anti-recursion: dispatched prompts forbid launching nested runs", async ()
     assert.ok(coder.prompts[0].includes("NEVER invoke the OAE CLI"), "coder prompt must forbid nested runs");
     assert.ok(reviewer.prompts[0].includes("NEVER invoke the OAE CLI"), "reviewer prompt must forbid nested runs");
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("empty coder response is retried, never sent to review", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-empty", "empty then good");
+    const coders = [
+      new FakeRunner("s-empty", { type: "complete", output: "" }),
+      new FakeRunner("s-ok", { type: "complete", output: "RESULT:\nfiles: src/hello.ts" }),
+    ];
+    const reviewer = new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK });
+    let codeIdx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? coders[codeIdx++]! : reviewer),
+    });
+    const { state } = await orch.run("empty then good");
+    assert.equal(state.status, "done", `summary: ${state.summary}`);
+    assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "code").length, 2, "one empty attempt + one real");
+    assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "review").length, 1, "reviewer only saw the real attempt");
+    assert.equal(reviewer.prompts.length, 1, "no reviewer session spent on the empty attempt");
+    assert.ok(state.decisions.some((d) => d.text.includes("empty response")), "empty response decision recorded");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("all attempts empty: task blocked at the attempt limit, zero review sessions", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxAttempts = 2;
+    const store = await Store.create(dir, "run-allempty", "always empty");
+    const coders = [
+      new FakeRunner("s-e1", { type: "complete", output: "" }),
+      new FakeRunner("s-e2", { type: "complete", output: "   " }),
+    ];
+    let codeIdx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder"
+        ? coders[codeIdx++]!
+        : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+    });
+    const { state } = await orch.run("always empty");
+    const task = state.tasks[0];
+    assert.equal(task.status, "blocked");
+    assert.ok((task.blockedReason ?? "").includes("empty"), `blockedReason: ${task.blockedReason}`);
+    assert.equal(task.attempts.filter((a) => a.kind === "code").length, 2, "attempt limit respected");
+    assert.equal(task.attempts.filter((a) => a.kind === "review").length, 0, "no review session burned");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("per-attempt token telemetry is recorded when the runner provides usage", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-usage", "telemetry");
+    const usage: SessionUsage = { input: 11, output: 7, reasoning: 5, cacheRead: 900, cacheWrite: 0, cost: null };
+    const coder = Object.assign(FACTORY_OK_CODER(), { usage: async () => usage });
+    const reviewer = Object.assign(new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK }), {
+      usage: async () => ({ ...usage, input: 3 }),
+    });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? coder : reviewer),
+    });
+    await orch.run("telemetry");
+    const code = store.state.tasks[0].attempts.find((a) => a.kind === "code")!;
+    const rev = store.state.tasks[0].attempts.find((a) => a.kind === "review")!;
+    assert.deepEqual(JSON.parse(code.evidence.tokens ?? "null"), usage, "coder attempt records service usage");
+    assert.equal(JSON.parse(rev.evidence.tokens ?? "{}").input, 3, "review attempt records service usage");
+    assert.equal(rev.evidence.verdict, "approve", "verdict evidence preserved");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("runner deadline expiry interrupts the session (no orphan keeps burning tokens)", async () => {
+  const counters: { interrupt?: number } = {};
+  const client = stubClient({}, counters);
+  const runner = await OpenCodeRunner.start(client, {
+    directory: ".", title: "t", agent: "build", promptText: "p",
+  });
+  const res = await runner.awaitCompletion(0); // deadline already reached
+  assert.equal(res.outcome, "interrupted");
+  assert.equal(counters.interrupt, 1, "the service session must be interrupted when the deadline expires");
+});
+
+test("runner completion path: long plan output survives (no 4000-char truncation) and context is fetched once", async () => {
+  const longPlan = JSON.stringify({ summary: "s".repeat(4400), tasks: [{ id: "t1", title: "x", instructions: "i", dependsOn: [], acceptance: ["a"] }], decisions: [] });
+  assert.ok(longPlan.length > 4000, "fixture must exceed the old truncation bound");
+  const counters: { context?: number } = {};
+  const client = stubClient({
+    active: async () => ({} as Record<string, unknown>), // session already idle -> completes on first poll
+    context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [
+      { type: "user", text: "prompt" },
+      { type: "assistant", content: [{ type: "text", text: longPlan }] },
+      { type: "idle" },
+    ] }; },
+  }, counters);
+  const runner = await OpenCodeRunner.start(client, {
+    directory: ".", title: "t", agent: "build", promptText: "p",
+  });
+  const res = await runner.awaitCompletion(30_000);
+  assert.equal(res.outcome, "completed");
+  assert.equal(res.output, longPlan, "final output must not be truncated at 4000 chars");
+  const parsed = JSON.parse(res.output);
+  assert.equal(parsed.tasks.length, 1, "a >4000-char model plan JSON parses (planner fix)");
+  assert.equal(counters.context, 1, "completion path must fetch the transcript exactly once (observe only)");
+});
+
+test("runner start surfaces a rejected prompt instead of an empty success", async () => {
+  const client = stubClient({ prompt: async () => { throw new Error("402 budget exceeded"); } });
+  await assert.rejects(
+    OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" }),
+    /402 budget exceeded/,
+  );
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {

@@ -26,7 +26,7 @@ git clone <repo-url>
 cd opencode-autonomous-engineering
 npm install
 npm run typecheck        # tsc --noEmit
-npm test                 # 13 deterministic unit tests (no provider calls)
+npm test                 # 22 deterministic unit tests (no provider calls)
 npm run test:integration  # 1 real end-to-end test against the live service
 ```
 
