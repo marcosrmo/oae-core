@@ -244,3 +244,56 @@ service; (5) real-run validation classified in EFFICIENCY_AUDIT §8 — SSE
 feasibility was probed live on the running service (read-only), but runner
 behavior under live runs is so far unit-verified only, deliberately: no
 provider benchmarks were to be relaunched after the 429 incident (D15).
+
+## D17 — Orphaned-run reconciliation and crash-safe terminal state (Fase 0)
+
+**Problem (confirmed by forensics on `run-mvazafl3`).** The terminal state and
+the lock were written only on the normal path (`Orchestrator.run()` end and the
+`index.ts` `finally`). Two independent code paths could leave a run `running`
+forever:
+
+1. **Hard process death.** The process (pid 4984) died abnormally; the `finally`
+   never ran, so `state.json` stayed `running` with an open attempt and
+   `.oae/run.lock` kept a dead pid. No component ever revisited that state.
+2. **Unhandled throw inside `run()`.** The `try/finally` released the lock but
+   there was no `catch`, so `state.json` was left `running` with no lock at all.
+
+**Decision.** Two layers, mirroring D13's deterministic-guard philosophy:
+
+- **Write-side (prevention).** `index.ts` `run` registers exactly one
+  `SIGINT`/`SIGTERM`/`uncaughtException` handler per run (never per loop
+  iteration) and wraps `run()` in a `catch`. Both paths call
+  `finalizeAbandonedRun`, which marks a still-`running` run `interrupted` (never
+  `done`) and records `run_reconciled`. Idempotent: a terminal status is never
+  re-finalized. This cannot cover `SIGKILL`/power loss — the read side does.
+- **Read-side + explicit repair (detection).** `reconcile.ts` classifies the
+  lock owner as `alive`/`dead`/`unknown` **from evidence only**: a `running` run
+  is orphaned only when a `run.lock` exists AND its pid is provably not alive.
+  Absence of a lock, an invalid pid, or a pid the OS still reports are all
+  treated conservatively (never a false "interrupted"). `loadRunView`,
+  `oae status` and `oae report` project the effective status **without writing**;
+  `oae reconcile` persists it.
+
+**Additive, never destructive.** Reconciliation copies the pre-reconciliation
+`state.json` + `events.jsonl` into `.oae/history/<runId>/` before writing, so the
+original `running` evidence stays auditable. The lock is left intact (it is
+evidence and is reclaimed automatically by the next run because its pid is
+dead). `endedAt` is bounded by the last **recorded** evidence, never by
+wall-clock "now"; an orphaned attempt's end time stays **unknown** (no
+fabrication) and it is marked `interrupted`, never `completed`.
+
+**Lock hardening.** The lock now carries a random `token`; `releaseRunLock`
+removes a lock only when `runId` matches **and** the pid is ours, so one process
+can never delete another process's lock. `readRunLock`/`pidAlive` are exported.
+
+**Known limitation (recorded, not guessed away).** PID reuse: a pid the OS still
+reports as alive is treated as a live owner, so a reused pid could make an
+orphan look alive (a false negative, never a false positive). Identity beyond
+the pid — heartbeat plus lock-token verification by a supervising process — is
+P2 work.
+
+**Validation.** 53/53 deterministic unit tests (7 new regressions: dead-owner
+reconciliation, idempotency, live-owner/no-lock conservatism, read-only
+projection, in-process finalize, foreign-lock protection, CLI wiring). No
+provider calls. The preserved `run-mvazafl3` was reconciled by this mechanism
+(`running → interrupted`, snapshot archived) without deleting any evidence.

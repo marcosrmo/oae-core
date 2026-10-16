@@ -17,7 +17,8 @@ import { FakeRunner, REVIEWER_OK, REVIEWER_REJECT } from "./fake.ts";
 import { renderReport } from "../src/report.ts";
 import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
-import { acquireRunLock, releaseRunLock } from "../src/runlock.ts";
+import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
+import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
 import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type AgentRunResult, type ProgressSignal } from "../src/opencode.ts";
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
@@ -541,6 +542,193 @@ test("run lock: live foreign pid is refused; --force overrides; stale pid reclai
     const reclaimed = await acquireRunLock(dir, "run-new");
     assert.equal(reclaimed.ok, true);
     holder.kill();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/**
+ * Fase 0 regressions — orphaned-run detection (the run-mvazafl3 defect).
+ * `orphanState()` is a persisted `running` run with one open attempt, exactly
+ * the shape the frozen run had.
+ */
+function orphanState(over: Partial<RunState> = {}): RunState {
+  return demoState({
+    id: "run-orphan",
+    status: "running",
+    tasks: [{
+      id: "task-1", title: "orphan task", instructions: "i", dependsOn: [], acceptance: [], status: "in_progress",
+      recoveryCycles: 0, createdAt: "2026-10-16T10:00:10Z", updatedAt: "2026-10-16T10:00:30Z",
+      attempts: [{ id: 1, sessionId: "s1", agent: "build", kind: "code", startedAt: "2026-10-16T10:00:10Z", outcome: "running", summary: "", filesChanged: [], evidence: {} }],
+    }],
+    ...over,
+  });
+}
+
+function deadLock(runId: string): string {
+  // 999999999 is out of range for the OS (probe returns false deterministically)
+  return JSON.stringify({ pid: 999999999, runId, startedAt: "2026-10-16T10:00:00Z" });
+}
+
+test("orphan evidence: owner is only 'dead' when provably not alive; terminal states are never reclassified", () => {
+  assert.equal(probeOwner(undefined).state, "unknown", "no lock ⇒ unknown, never dead");
+  assert.equal(probeOwner({ pid: 0, runId: "r", startedAt: "x" }).state, "unknown", "invalid pid ⇒ unknown");
+  assert.equal(probeOwner({ pid: 5, runId: "r", startedAt: "x" }, () => false).state, "dead");
+  assert.equal(probeOwner({ pid: 5, runId: "r", startedAt: "x" }, () => true).state, "alive");
+
+  const dead = probeOwner({ pid: 5, runId: "r", startedAt: "x" }, () => false);
+  assert.equal(effectiveStatus(orphanState(), dead).status, "interrupted");
+  assert.equal(effectiveStatus(orphanState(), dead).orphaned, true);
+  // a terminal status is respected even with a dead owner
+  assert.equal(effectiveStatus(orphanState({ status: "done" }), dead).status, "done");
+  assert.equal(effectiveStatus(orphanState({ status: "done" }), dead).orphaned, false);
+  // a live owner keeps the run running
+  assert.equal(effectiveStatus(orphanState(), probeOwner({ pid: 5, runId: "r", startedAt: "x" }, () => true)).status, "running");
+});
+
+test("reconcile: a run whose lock owner is dead is interrupted, additively and idempotently (run-mvazafl3 regression)", async () => {
+  const dir = await makeProject();
+  try {
+    await writeOae(dir, orphanState(), [
+      { at: "2026-10-16T10:00:00Z", kind: "run_started", request: DEMO_REQUEST },
+      { at: "2026-10-16T10:00:10Z", kind: "attempt_added", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "running" },
+    ]);
+    await writeFile(join(dir, ".oae", "run.lock"), deadLock("run-orphan"), "utf8");
+
+    const r1 = await reconcileRun(dir, () => false);
+    assert.equal(r1.action, "reconciled");
+    assert.equal(r1.status, "interrupted");
+    assert.equal(r1.attemptsMarked, 1);
+
+    const after = JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as RunState;
+    assert.equal(after.status, "interrupted", "not 'done': no evidence of completion exists");
+    assert.equal(after.tasks[0]!.attempts[0]!.outcome, "interrupted", "an orphaned attempt is never declared completed");
+    assert.equal(after.tasks[0]!.attempts[0]!.endedAt, undefined, "an unknown attempt end is never fabricated");
+    assert.equal(after.endedAt, "2026-10-16T10:00:30Z", "endedAt is bounded by the last recorded evidence, not wall-clock now");
+
+    // the pre-reconciliation evidence stays auditable under .oae/history/<runId>/
+    const snapshot = JSON.parse(await readFile(join(dir, ".oae", "history", "run-orphan", "state.json"), "utf8")) as RunState;
+    assert.equal(snapshot.status, "running", "the original 'running' evidence is preserved");
+    assert.equal(snapshot.tasks[0]!.attempts[0]!.outcome, "running");
+
+    const evs = (await readFile(join(dir, ".oae", "events.jsonl"), "utf8")).trim().split(/\r?\n/).map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.equal(evs.filter((e) => e.kind === "run_reconciled").length, 1);
+
+    // idempotent: a second pass sees a terminal status and writes nothing
+    const r2 = await reconcileRun(dir, () => false);
+    assert.equal(r2.action, "none");
+    assert.equal(r2.status, "interrupted");
+    const evs2 = (await readFile(join(dir, ".oae", "events.jsonl"), "utf8")).trim().split(/\r?\n/).map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.equal(evs2.filter((e) => e.kind === "run_reconciled").length, 1, "no duplicated reconciliation events");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("reconcile: a live owner is never declared interrupted; a missing lock is not proof", async () => {
+  const dir = await makeProject();
+  try {
+    await writeOae(dir, orphanState(), [{ at: "2026-10-16T10:00:00Z", kind: "run_started" }]);
+    await writeFile(join(dir, ".oae", "run.lock"), JSON.stringify({ pid: process.pid, runId: "run-orphan", startedAt: "x" }), "utf8");
+    const live = await reconcileRun(dir, () => true);
+    assert.equal(live.action, "none", "a possibly-live owner must never be reconciled away");
+    assert.equal((JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as RunState).status, "running");
+
+    await rm(join(dir, ".oae", "run.lock"), { force: true });
+    const noLock = await reconcileRun(dir, () => false);
+    assert.equal(noLock.action, "none", "no lock ⇒ no proof of a dead owner ⇒ conservative");
+    assert.equal(noLock.status, "running");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("dashboard projection: an orphaned run renders as interrupted without writing to disk", async () => {
+  const dir = await makeProject();
+  try {
+    await writeOae(dir, orphanState(), [
+      { at: "2026-10-16T10:00:00Z", kind: "run_started", request: DEMO_REQUEST },
+      { at: "2026-10-16T10:00:10Z", kind: "attempt_added", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "running" },
+      { at: "2026-10-16T10:02:27Z", kind: "agent_progress", taskId: "task-1", attemptId: 1, signalKind: "tool", detail: "messages=4" },
+    ]);
+    await writeFile(join(dir, ".oae", "run.lock"), deadLock("run-orphan"), "utf8");
+    const before = await readFile(join(dir, ".oae", "state.json"), "utf8");
+
+    const v = await loadRunView(dir, { isAlive: () => false, nowMs: Date.parse("2026-10-16T20:00:00Z") });
+    assert.ok(v);
+    assert.equal(v!.status, "interrupted");
+    assert.equal(v!.phase, "interrompida (processo ausente)");
+    assert.equal(v!.orphaned, true);
+    assert.ok((v!.ownerReason ?? "").includes("999999999"));
+
+    const text = renderSummary(v!, { width: 100 });
+    assert.ok(!text.includes("agente ativo"), "a dead run is never shown as actively working");
+    assert.ok(text.includes("execução órfã"), "the orphan evidence is surfaced");
+    assert.ok(renderResultLine(v!, { colors: false }).includes("INTERROMPIDA"), "interruption is distinct from failure");
+
+    // read-only guarantee: the projection never persists anything
+    assert.equal(await readFile(join(dir, ".oae", "state.json"), "utf8"), before, "loadRunView must not write state.json");
+    await assert.rejects(stat(join(dir, ".oae", "history")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("crash safety: an in-process abnormal exit finalizes a running run to interrupted (idempotent)", async () => {
+  const dir = await makeProject();
+  try {
+    const store = await Store.create(dir, "run-crash", "demo");
+    await store.addTask({ id: "task-1", title: "t", instructions: "i", dependsOn: [], acceptance: [] });
+    await store.addAttempt("task-1", { sessionId: "s1", agent: "build", kind: "code", startedAt: new Date().toISOString(), outcome: "running", summary: "", filesChanged: [], evidence: {} });
+    assert.equal(store.state.status, "running");
+
+    assert.equal(await finalizeAbandonedRun(store, "received SIGINT"), true);
+    assert.equal(store.state.status, "interrupted", "an exception/interrupt must never leave 'running'");
+    assert.equal(store.state.tasks[0]!.attempts[0]!.outcome, "interrupted");
+
+    const onDisk = JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as RunState;
+    assert.equal(onDisk.status, "interrupted");
+
+    // idempotent: the terminal state is never re-finalized
+    assert.equal(await finalizeAbandonedRun(store, "again"), false);
+    assert.equal(store.state.summary, "interrupted: received SIGINT", "the first reason is kept");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("run lock: a foreign pid's lock survives our release; acquire stamps an ownership token", async () => {
+  const dir = await makeProject();
+  try {
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "run.lock"), JSON.stringify({ pid: 999999999, runId: "run-foreign", startedAt: "x", token: "t" }), "utf8");
+    await releaseRunLock(dir, "run-foreign"); // matching runId, foreign pid
+    assert.ok(await stat(join(dir, ".oae", "run.lock")), "a lock held by another process must never be removed");
+
+    await rm(join(dir, ".oae", "run.lock"), { force: true });
+    await acquireRunLock(dir, "run-token");
+    const lock = await readRunLock(dir);
+    assert.ok(lock);
+    assert.equal(typeof lock!.token, "string");
+    assert.ok((lock!.token ?? "").length >= 8, "the token is a real per-acquisition witness");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI: `oae status` reports the effective status and `oae reconcile` persists it", async () => {
+  const dir = await makeProject();
+  try {
+    await writeOae(dir, orphanState(), [{ at: "2026-10-16T10:00:00Z", kind: "run_started" }]);
+    await writeFile(join(dir, ".oae", "run.lock"), deadLock("run-orphan"), "utf8");
+    const run = (args: string[]) => new Promise<{ code: number | null; out: string }>((res) => {
+      const child = spawn(process.execPath, [join("src", "index.ts"), ...args], { cwd: process.cwd(), env: { ...process.env } });
+      let out = "";
+      child.stdout?.on("data", (d) => (out += d));
+      child.stderr?.on("data", (d) => (out += d));
+      child.on("close", (code) => res({ code, out }));
+      child.on("error", () => res({ code: -1, out }));
+    });
+
+    const st = await run(["status", "--dir", dir]);
+    assert.equal(st.code, 0);
+    assert.ok(st.out.includes("run: interrupted"), `status must not report a dead owner as running (${st.out})`);
+
+    const rec = await run(["reconcile", "--dir", dir]);
+    assert.equal(rec.code, 0);
+    assert.ok(rec.out.includes("reconciled run-orphan"), `reconcile output: ${rec.out}`);
+    assert.ok(rec.out.includes("snapshot preservado"), "the preserved snapshot is reported");
+
+    const after = JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as RunState;
+    assert.equal(after.status, "interrupted");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -1356,10 +1544,15 @@ test("dashboard follow loop registers NO SIGINT listeners across 15 cycles (leak
   // (Cross-process SIGINT delivery is not reliable on Windows, so an
   // end-to-end Ctrl+C subprocess test would be flaky — documented, not faked.)
   const cli = await readFile(join("src", "index.ts"), "utf8");
-  assert.equal(cli.includes('process.once("SIGINT"'), false,
-    "per-iteration SIGINT registration reintroduced in src/index.ts");
-  assert.equal(cli.includes('process.on("SIGINT"'), false,
-    "global SIGINT handler reintroduced in src/index.ts");
+  // the historical leak was a hand-rolled per-iteration wait that registered a
+  // SIGINT listener every second; the follow loop must use the plain sleep
+  assert.equal(/setTimeout\(r,\s*1000\)/.test(cli), false,
+    "the per-iteration wait that leaked SIGINT listeners must not return");
+  assert.ok(cli.includes("await sleep(1000)"), "the follow loop waits with the plain sleep");
+  // exactly ONE SIGINT handler is allowed — the run() crash-safety path — and it
+  // is registered once per run, never once per follow-loop iteration
+  assert.equal((cli.match(/process\.once\("SIGINT"/g) ?? []).length, 1,
+    "exactly one SIGINT handler (crash safety) is expected in src/index.ts");
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {

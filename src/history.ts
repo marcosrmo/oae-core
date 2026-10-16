@@ -23,6 +23,19 @@ export interface HistoryEntry {
   source: "current" | "archived";
 }
 
+/** Archive a run's current state/events under `.oae/history/<runId>/` — used by
+ * Store.create (before overwriting) and by reconciliation (before writing a
+ * terminal status), so the original evidence stays auditable. Copy-based and
+ * idempotent: a crash between copy and write never loses the original. */
+export async function archiveRunSnapshot(projectDir: string, runId: string): Promise<string> {
+  const dir = join(projectDir, ".oae");
+  const dest = join(dir, "history", runId.replace(/[^\w.-]/g, "_"));
+  await mkdir(dest, { recursive: true });
+  await copyFile(join(dir, "state.json"), join(dest, "state.json")).catch(() => undefined);
+  await copyFile(join(dir, "events.jsonl"), join(dest, "events.jsonl")).catch(() => undefined);
+  return dest;
+}
+
 /** Archive previous state before Store.create overwrites it. Idempotent:
  * copy (not move) so a crash between copy and overwrite never loses the
  * original, and re-running on an existing archive is harmless. */
@@ -31,11 +44,7 @@ export async function archivePreviousRun(projectDir: string, newRunId: string): 
   const dir = join(projectDir, ".oae");
   const previous = await readJson<RunState>(join(dir, "state.json"));
   if (!previous || previous.id === newRunId) return undefined;
-  const dest = join(dir, "history", previous.id.replace(/[^\w.-]/g, "_"));
-  await mkdir(dest, { recursive: true });
-  await copyFile(join(dir, "state.json"), join(dest, "state.json")).catch(() => undefined);
-  await copyFile(join(dir, "events.jsonl"), join(dest, "events.jsonl")).catch(() => undefined);
-  return dest;
+  return archiveRunSnapshot(projectDir, previous.id);
 }
 
 async function readEvents(projectDir: string): Promise<Array<Record<string, unknown>>> {

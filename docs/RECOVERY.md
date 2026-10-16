@@ -58,6 +58,32 @@ The recovery context (`buildRecoveryContext`) gives the fresh agent:
 Reviewer rejections are recycled the same way: findings become refined instructions
 for the next code attempt.
 
+## Orphaned runs (owner process gone)
+
+A run can stop existing without writing a terminal state: the process may be
+killed (`SIGKILL`, terminal closed, machine lost) — the `finally` that releases
+the lock and the code that writes `status` never run. Since D17 that is handled
+in two layers:
+
+- **Prevention** — `oae run` handles `SIGINT`/`SIGTERM`/`uncaughtException` and
+  marks a still-`running` run `interrupted` before exiting.
+- **Detection + repair** — `reconcile.ts` reads `.oae/run.lock` and asks whether
+  the owner pid is alive. If a `running` run's lock owner is provably gone, the
+  run is *orphaned*:
+
+  - `oae status`, `oae dashboard` and `oae report` **project** it as
+    `interrupted` (phase `interrompida (processo ausente)`) without writing
+    anything;
+  - `oae reconcile --dir .` **persists** it: the pre-reconciliation
+    `state.json`+`events.jsonl` are copied to `.oae/history/<runId>/` first, open
+    attempts become `interrupted` (never `completed`), `endedAt` is bounded by
+    the last recorded evidence, and a `run_reconciled` event records the proof.
+
+Evidence rules (never a false interruption): no lock, an invalid pid, or a pid
+the OS still reports as alive are all treated conservatively. Reconciliation is
+idempotent and never removes the lock. A lock whose pid is dead is reclaimed
+automatically by the next `oae run`.
+
 ## Inspecting / resuming a run
 
 - `.oae/state.json` — full state: tasks, attempts (session ids, outcomes, files

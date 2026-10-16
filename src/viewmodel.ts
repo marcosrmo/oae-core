@@ -17,6 +17,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readJson } from "./util.ts";
+import { readRunLock } from "./runlock.ts";
+import { effectiveStatus, lastEvidenceAt, probeOwner } from "./reconcile.ts";
 import type { Attempt, RunState } from "./store.ts";
 import type { OaeEvent } from "./events.ts";
 
@@ -73,6 +75,11 @@ export interface RunView {
   status: string;
   /** Derived operational phase while status="running"; terminal otherwise. */
   phase: RunPhase;
+  /** True when a `running` run was reclassified because its lock owner is gone. */
+  orphaned?: boolean;
+  /** Owner liveness evidence backing the (possibly reclassified) status. */
+  ownerState?: "alive" | "dead" | "unknown";
+  ownerReason?: string;
   startedAt: string;
   endedAt?: string;
   elapsedMs: number;
@@ -166,6 +173,7 @@ const KIND_LABEL: Record<string, string> = {
   supervisor_quarantine: "supervisor quarantine (limits reached)",
   task_error: "task error",
   run_finished: "run finished",
+  run_reconciled: "run reconciled (owner process gone)",
   unparseable: "unparseable event line",
 };
 
@@ -187,6 +195,8 @@ function levelOf(kind: string, ev: OaeEvent): RunViewLevel {
       return ["completed", "approved"].includes(str(ev.outcome) ?? "") ? "success" : "error";
     case "run_finished":
       return ev.status === "done" ? "success" : "error";
+    case "run_reconciled":
+      return "warn";
     default:
       return "info";
   }
@@ -215,6 +225,7 @@ function evLabel(kind: string, ev: OaeEvent, attemptAgent: Map<string, string>):
     case "supervisor_quarantine": return `supervisor quarantine: task ${str(ev.taskId)}`;
     case "task_error": return `task error ${str(ev.taskId)}: ${(str(ev.error) ?? "").slice(0, 100)}`;
     case "run_finished": return `run finished: ${str(ev.status)}`;
+    case "run_reconciled": return `run reconciled: ${str(ev.from) ?? "?"} → ${str(ev.to) ?? "interrupted"} (${str(ev.reason) ?? "owner gone"})`;
     case "unparseable": return "unparseable event line";
     default: {
       const label = str(ev.kind) ? `event: ${ev.kind}` : "event";
@@ -224,11 +235,12 @@ function evLabel(kind: string, ev: OaeEvent, attemptAgent: Map<string, string>):
 }
 
 /** Derive the operational phase from the event tail + task states. Pure. */
-function derivePhase(state: RunState, events: OaeEvent[], nowMs: number, stallThresholdMs: number): { phase: RunPhase; stallMs?: number } {
-  if (state.status === "done") return { phase: "concluída" };
-  if (state.status === "failed") return { phase: "falhou" };
-  if (state.status === "cancelled") return { phase: "cancelada" };
-  if (state.status === "running" && events.length === 0) return { phase: "inicializando" };
+function derivePhase(state: RunState, status: string, events: OaeEvent[], nowMs: number, stallThresholdMs: number): { phase: RunPhase; stallMs?: number } {
+  if (status === "done") return { phase: "concluída" };
+  if (status === "failed") return { phase: "falhou" };
+  if (status === "cancelled") return { phase: "cancelada" };
+  if (status === "interrupted") return { phase: "interrompida (processo ausente)" };
+  if (status === "running" && events.length === 0) return { phase: "inicializando" };
   const hasPlan = state.tasks.length > 0 || events.some((e) => e.kind === "plan_ready");
   if (!hasPlan) return { phase: "planejando" };
 
@@ -278,12 +290,16 @@ function derivePhase(state: RunState, events: OaeEvent[], nowMs: number, stallTh
   return { phase: "aguardando", stallMs };
 }
 
-export async function loadRunView(projectDir: string, opts?: { nowMs?: number; stallThresholdMs?: number }): Promise<RunView | undefined> {
+export async function loadRunView(projectDir: string, opts?: { nowMs?: number; stallThresholdMs?: number; isAlive?: (pid: number) => boolean }): Promise<RunView | undefined> {
   const nowMs = opts?.nowMs ?? Date.now();
   const stallThresholdMs = opts?.stallThresholdMs ?? 7 * 60_000;
   const state = await readJson<RunState>(join(projectDir, ".oae", "state.json"));
   if (!state) return undefined;
   const events = await readEventsFile(projectDir);
+  // owner liveness evidence: a `running` run whose lock owner is provably gone
+  // is projected as `interrupted` — the panel must never show a dead run as active
+  const owner = probeOwner(await readRunLock(projectDir), opts?.isAlive);
+  const eff = effectiveStatus(state, owner);
 
   // Attempt views: agent names come from state (events lack them).
   const attemptAgent = new Map<string, string>();
@@ -337,27 +353,33 @@ export async function loadRunView(projectDir: string, opts?: { nowMs?: number; s
   // legacy runs (pre-instrumentation) have no agent telemetry at all: fall
   // back to the latest event line so stall detection still works, clearly
   // labelled as a weaker signal
-  if (state.status === "running" && !lastConfirmed && timeline.length) {
+  if (eff.status === "running" && !lastConfirmed && timeline.length) {
     const last = timeline.at(-1)!;
     lastConfirmed = { at: last.at, label: `${last.label} (sem telemetria de agente nesta execução)` };
   }
   let secondsSinceActivity: number | undefined;
   let stallMs: number | undefined;
-  if (state.status === "running" && lastConfirmed) {
+  if (eff.status === "running" && lastConfirmed) {
     secondsSinceActivity = Math.max(0, Math.round((nowMs - Date.parse(lastConfirmed.at)) / 1000));
     if (secondsSinceActivity * 1000 > stallThresholdMs) stallMs = secondsSinceActivity * 1000;
   }
-  const derivedPhase = derivePhase(state, events, nowMs, stallThresholdMs);
+  const derivedPhase = derivePhase(state, eff.status, events, nowMs, stallThresholdMs);
+  // a projected (not yet persisted) interruption is bounded by the last
+  // recorded evidence, exactly like the persisted reconciliation — never "now"
+  const displayEndedAt = state.endedAt ?? (eff.orphaned ? lastEvidenceAt(state) : undefined);
 
   return {
     id: state.id,
     request: state.request,
     projectDir,
-    status: state.status,
+    status: eff.status,
     phase: derivedPhase.phase,
+    orphaned: eff.orphaned,
+    ownerState: owner.state,
+    ownerReason: eff.orphaned ? eff.reason : undefined,
     startedAt: state.startedAt,
-    endedAt: state.endedAt,
-    elapsedMs: Math.max(0, (state.endedAt ? Date.parse(state.endedAt) : nowMs) - Date.parse(state.startedAt)),
+    endedAt: displayEndedAt,
+    elapsedMs: Math.max(0, (displayEndedAt ? Date.parse(displayEndedAt) : nowMs) - Date.parse(state.startedAt)),
     nowMs,
     tasks,
     timeline,

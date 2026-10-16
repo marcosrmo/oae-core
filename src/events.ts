@@ -36,6 +36,7 @@ export const EventKind = {
   SupervisorQuarantine: "supervisor_quarantine",
   TaskError: "task_error",
   RunFinished: "run_finished",
+  RunReconciled: "run_reconciled",
 } as const;
 
 /** One parsed events.jsonl line (unknown kinds are preserved, not dropped). */

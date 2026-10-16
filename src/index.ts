@@ -25,7 +25,8 @@ import { renderReport } from "./report.ts";
 import { inspectGit } from "./git.ts";
 import { checkRemote, publish } from "./publish.ts";
 import { installIntoProject } from "./setup.ts";
-import { acquireRunLock, releaseRunLock } from "./runlock.ts";
+import { acquireRunLock, releaseRunLock, readRunLock } from "./runlock.ts";
+import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "./reconcile.ts";
 import { loadRunView } from "./viewmodel.ts";
 import { renderSummary, renderResultLine, type RenderOptions } from "./dashboard.ts";
 import { listRunHistory, type HistoryEntry } from "./history.ts";
@@ -74,6 +75,28 @@ async function main(): Promise<number> {
       const runId = `run-${Date.now().toString(36)}`;
       const lock = await acquireRunLock(dir, runId, { force: flag("--force", argv) });
       if (!lock.ok) { console.error(`oae: refusing to start: ${lock.reason}`); return 3; }
+
+      // Crash safety (Fase 0): an exception inside run() or an interrupt during
+      // the run must NEVER leave state.json stuck at "running" for a process
+      // that no longer exists — that is exactly how run-mvazafl3 became orphaned.
+      let store: Store | undefined;
+      let finalized = false;
+      const finalize = async (reason: string): Promise<void> => {
+        if (finalized) return; // idempotent: catch path and signal path can both fire
+        finalized = true;
+        try { if (store) await finalizeAbandonedRun(store, reason); } catch { /* best effort */ }
+      };
+      const onSignal = (sig: string) => {
+        void finalize(`received ${sig}`).finally(() => {
+          void releaseRunLock(dir, runId).finally(() => process.exit(130));
+        });
+      };
+      const onInt = () => onSignal("SIGINT");
+      const onTerm = () => onSignal("SIGTERM");
+      const onUncaught = (err: unknown) => onSignal(`uncaught exception: ${String((err as Error)?.message ?? err)}`);
+      process.once("SIGINT", onInt);
+      process.once("SIGTERM", onTerm);
+      process.once("uncaughtException", onUncaught);
       try {
         // auto-install the reviewer agent + skills when missing (idempotent)
         try {
@@ -82,7 +105,7 @@ async function main(): Promise<number> {
           await installIntoProject(dir);
           console.log(`(oae-reviewer agent + skills installed into ${dir})`);
         }
-        const store = await Store.create(dir, runId, request);
+        store = await Store.create(dir, runId, request);
         const { client } = await connect();
         const orch = new Orchestrator(client, store, { config, dryRun: flag("--dry-run", argv) });
         const { state } = await orch.run(request);
@@ -91,7 +114,13 @@ async function main(): Promise<number> {
         console.log(report);
         console.log(`\n(report saved: ${join(dir, ".oae", "REPORT.md")})`);
         return state.status === "done" ? 0 : 1;
+      } catch (e) {
+        await finalize(`run() threw: ${String((e as Error)?.message ?? e)}`);
+        throw e;
       } finally {
+        process.removeListener("SIGINT", onInt);
+        process.removeListener("SIGTERM", onTerm);
+        process.removeListener("uncaughtException", onUncaught);
         await releaseRunLock(dir, runId);
       }
     }
@@ -116,10 +145,13 @@ async function main(): Promise<number> {
     case "status": {
       const store = await Store.loadLatest(dir);
       if (!store) { console.log("no runs found"); return 1; }
+      // owner liveness evidence: a dead owner is never reported as active
+      const eff = effectiveStatus(store.state, probeOwner(await readRunLock(dir)));
       for (const t of store.state.tasks) {
         console.log(`${t.id}\t${t.status}\t${t.title}${t.blockedReason ? `\t(${t.blockedReason})` : ""}`);
       }
-      console.log(`run: ${store.state.status}`);
+      console.log(`run: ${eff.status}`);
+      if (eff.orphaned) console.log(`  (órfã: ${eff.reason}; rode \`oae reconcile --dir ${dir}\`)`);
       return 0;
     }
     case "dashboard":
@@ -172,7 +204,22 @@ async function main(): Promise<number> {
     case "report": {
       const store = await Store.loadLatest(dir);
       if (!store) { console.log("no runs found"); return 1; }
+      const eff = effectiveStatus(store.state, probeOwner(await readRunLock(dir)));
+      if (eff.orphaned) store.state.status = eff.status; // display-only; nothing is persisted
       console.log(await renderReport(store));
+      return 0;
+    }
+    case "reconcile": {
+      // explicit, additive, idempotent: archives the pre-reconciliation
+      // snapshot, then writes the terminal status an orphaned run never got
+      const r = await reconcileRun(dir);
+      if (r.action === "reconciled") {
+        console.log(`reconciled ${r.runId}: running → ${r.status} (${r.reason})`);
+        console.log(`  snapshot preservado em ${r.archiveDir}`);
+        if (r.attemptsMarked) console.log(`  tentativas em aberto marcadas como interrupted: ${r.attemptsMarked}`);
+      } else {
+        console.log(`nada a reconciliar: ${r.status ?? "sem estado"} (${r.reason})`);
+      }
       return 0;
     }
     case "init": {
@@ -190,7 +237,7 @@ async function main(): Promise<number> {
       return r.pushed ? 0 : 1;
     }
     default:
-      console.log("commands: run | plan | status | report | init | publish | dashboard | history");
+      console.log("commands: run | plan | status | report | init | publish | dashboard | history | reconcile");
       return 2;
   }
 }

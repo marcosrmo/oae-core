@@ -51,13 +51,15 @@ export interface Decision {
   rationale: string;
 }
 
+export type RunStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
+
 export interface RunState {
   id: string;
   request: string;
   projectDir: string;
   startedAt: string;
   endedAt?: string;
-  status: "running" | "done" | "failed" | "cancelled";
+  status: RunStatus;
   git: { branch: string; baselineCommit?: string; baselineUncommitted?: string[]; worktree?: string };
   tasks: Task[];
   decisions: Decision[];

@@ -165,6 +165,7 @@ Comandos que **existem** hoje (CLI em `src/index.ts`):
 | `oae report` | Relatório final baseado em evidências (texto) | `--dir` |
 | `oae dashboard` (alias `watch`) | Painel do run atual | `--dir`, `--follow`, `--detail` |
 | `oae history` | Lista runs atuais + arquivados (com contagem 429/401) | `--dir` |
+| `oae reconcile` | Reconcilia um run órfão (dono do lock morto): preserva snapshot e grava `interrupted` | `--dir` |
 | `oae init` | Instala `.opencode/` (skills + agente revisor) no projeto | `--dir` |
 | `oae publish` | Publica no GitHub (somente com autorização explícita) | `--dir`, `--repo`, `--public` |
 
@@ -229,10 +230,12 @@ TTY real; em pipe/CI a saída é texto limpo.
 - **Progresso é seletivo.** Só eventos materiais de ciclo de vida geram sinal; silêncio entre
   ferramentas pode parecer ausência de sinal e o veredito de estagnação continua sendo por
   tempo.
-- **Crash do processo não finaliza o estado.** Não há handler de saída anômala que reescreva
-  `state.json`. Se o processo morre no meio de uma tentativa, o estado permanece `running` e
-  o painel corretamente o exibe como `sem progresso detectável` (a recuperação de um run
-  interrompido — `oae resume` — ainda não existe).
+- **Interrupção do processo.** `oae run` trata `SIGINT`/`SIGTERM`/exceções e grava
+  `interrupted` (nunca deixa `running` órfão). Se o processo for morto de forma abrupta
+  (`SIGKILL`/queda de energia), `oae status`/`oae dashboard` projetam o run como
+  `interrupted` (órfã) e `oae reconcile --dir .` persiste o estado, preservando um snapshot
+  do original em `.oae/history/`. A retomada de um run interrompido — `oae resume` — ainda
+  não existe.
 - **Sem benchmarks válidos** de economia de tokens ou latência: as medições antes/depois
   foram invalidadas pelo incidente de limites do provedor; apenas proxies estruturais são
   afirmados (ver `docs/EFFICIENCY_AUDIT.md` §8).

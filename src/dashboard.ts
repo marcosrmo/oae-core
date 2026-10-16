@@ -72,6 +72,12 @@ export function renderSummary(view: RunView, opts: RenderOptions = {}): string {
   if (view.stallMs !== undefined) {
     out.push(`${c.warn}⚠ sem progresso detectável há ${formatDuration(view.stallMs)}${c.reset}`);
   }
+  if (view.orphaned) {
+    // the panel's honesty rule: a run whose owner process is gone is shown as
+    // interrupted with the evidence, never as active
+    out.push(`${c.error}✗ execução órfã: ${truncateCell(view.ownerReason ?? "processo dono ausente", width - 20)}${c.reset}`);
+    out.push(`  ${c.dim}reconciliável com \`oae reconcile --dir <projeto>\` (o histórico é preservado)${c.reset}`);
+  }
 
   // ---- alerts ----
   const alerts: string[] = [];
@@ -149,6 +155,7 @@ export function renderResultLine(view: RunView, opts: RenderOptions = {}): strin
   const failed = view.tasks.filter((t) => ["failed", "blocked"].includes(t.status)).length;
   const valOk = view.validators.length ? view.validators.every((v) => v.code === 0 && !v.timedOut) : undefined;
   const warn = view.status === "running" ? `${c.warn}EM EXECUÇÃO — resultado ainda indefinido${c.reset}` :
+    view.status === "interrupted" ? `${c.warn}INTERROMPIDA — processo OAE ausente${c.reset}` :
     view.phase === "concluída" ? `${c.success}CONCLUÍDA${c.reset}` : `${c.error}FALHOU/BLOQUEADA${c.reset}`;
   return `status: ${warn} · tarefas: ${done} concluídas${failed ? `, ${failed} bloqueadas/failed` : ""}${valOk !== undefined ? ` · validadores: ${valOk ? "ok" : "falhou"}` : ""} · ${formatDuration(view.elapsedMs)} · tokens: ${view.tokens.totals.unknown ? "desconhecido" : `${view.tokens.totals.input} in/${view.tokens.totals.output} out`}`;
 }

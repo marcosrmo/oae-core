@@ -10,6 +10,7 @@
  * `--force` overrides a live foreign lock (explicit operator action only).
  */
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { nowISO } from "./util.ts";
 
@@ -17,15 +18,31 @@ export interface RunLockInfo {
   pid: number;
   runId: string;
   startedAt: string;
+  /**
+   * Random per-acquisition token. It lets the owner prove a lock is still its
+   * own (pid alone can be reused by the OS); the token is never interpreted as
+   * a secret — it is only an ownership witness.
+   */
+  token?: string;
 }
 
 function lockFile(projectDir: string): string {
   return join(projectDir, ".oae", "run.lock");
 }
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** Read the current lock, if any. Never throws. */
+export async function readRunLock(projectDir: string): Promise<RunLockInfo | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lockFile(projectDir), "utf8")) as RunLockInfo;
+    return parsed && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface RunLockResult {
@@ -58,7 +75,7 @@ export async function acquireRunLock(
   }
   try {
     await mkdir(join(projectDir, ".oae"), { recursive: true });
-    const info: RunLockInfo = { pid: process.pid, runId, startedAt: nowISO() };
+    const info: RunLockInfo = { pid: process.pid, runId, startedAt: nowISO(), token: randomUUID() };
     await writeFile(file, JSON.stringify(info, null, 2), "utf8");
     return { ok: true };
   } catch (e) {
@@ -71,7 +88,10 @@ export async function releaseRunLock(projectDir: string, runId: string): Promise
   const file = lockFile(projectDir);
   try {
     const cur = JSON.parse(await readFile(file, "utf8")) as RunLockInfo;
+    // never remove a lock that belongs to another run, nor — defensively — one
+    // held by another process: a pid we do not own must keep its lock
     if (cur.runId !== runId) return;
+    if (Number.isInteger(cur.pid) && cur.pid !== process.pid) return;
     await rm(file, { force: true });
   } catch { /* already gone */ }
 }
