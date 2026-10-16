@@ -25,6 +25,8 @@ export interface RecoveryConfig {
   commandTimeoutMs: number;// default 5 min
   /** Max recovery attempts before a task is quarantined (anti-recursion). */
   maxRecoveryCycles: number; // default 2
+  /** Re-asks to the reviewer when its verdict is unparseable and validators pass (no coder attempt spent). */
+  maxReviewReasks: number; // default 1
 }
 
 export interface OaeConfig {
@@ -51,6 +53,7 @@ export function defaultRecovery(): RecoveryConfig {
     runTimeoutMs: 2 * 60 * 60_000,
     commandTimeoutMs: 5 * 60_000,
     maxRecoveryCycles: 2,
+    maxReviewReasks: 1,
   };
 }
 

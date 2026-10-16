@@ -56,7 +56,12 @@ const CODER_PROMPT = (task: Task, stack: string, validators: string[], refined?:
   "   autonomous engineering run — you are already inside one; nested runs are refused and waste resources.",
 ].join("\n");
 
-const REVIEWER_PROMPT = (task: Task, diff: string) => [
+const REVIEWER_PROMPT = (task: Task, diff: string, formatReminder?: boolean) => [
+  ...(formatReminder
+    ? ["REMINDER: your ENTIRE reply must be exactly ONE JSON object — no prose before or after it.",
+       "Your previous reply was prose and could not be parsed; repeat the review and answer in JSON only.",
+       ""]
+    : []),
   "You are the independent reviewer of an autonomous engineering run.",
   "Review the changes below for: logical errors, regressions, security issues,",
   "architecture inconsistencies, and unmet acceptance criteria.",
@@ -239,13 +244,13 @@ export class Orchestrator {
   private recoveryContext = new Map<string, string>();
   private baselineUncommitted: string[] = [];
 
-  private async dispatch(kind: "coder" | "reviewer", task: Task, refined?: string): Promise<{ runner: AgentRunner; prompt: string }> {
+  private async dispatch(kind: "coder" | "reviewer", task: Task, refined?: string, reviewFormatReminder?: boolean): Promise<{ runner: AgentRunner; prompt: string }> {
     const cfg = this.opts.config;
     const stack = await detectStack(cfg.projectDir);
     const validators = (cfg.validators.length ? cfg.validators : defaultValidators(cfg.projectDir, stack)).map((v) => `${v.cmd} ${v.args.join(" ")}`);
     const prompt = kind === "coder"
       ? CODER_PROMPT(task, stack, validators, refined)
-      : REVIEWER_PROMPT(task, await git.diffUncommitted(cfg.projectDir));
+      : REVIEWER_PROMPT(task, await git.diffUncommitted(cfg.projectDir), reviewFormatReminder);
     const agent = kind === "coder" ? cfg.coderAgent : cfg.reviewerAgent;
     if (this.opts.runnerFactory) {
       const runner = this.opts.runnerFactory(kind, task);
@@ -265,6 +270,30 @@ export class Orchestrator {
   private async collectUsage(runner: AgentRunner): Promise<import("./opencode.ts").SessionUsage | null> {
     if (!runner.usage) return null;
     try { return await runner.usage(); } catch { return null; }
+  }
+
+  /** One independent review session; records the attempt and returns the parsed verdict. */
+  private async runReview(task: Task, formatReminder = false): Promise<{ verdict: ReviewVerdict | undefined }> {
+    const cfg = this.opts.config;
+    const rev = await this.dispatch("reviewer", task, undefined, formatReminder);
+    this.supervisor.unregister(task.id); // reviewer is short; supervision stays on the coder path
+    const revAttempt = await this.store.addAttempt(task.id, {
+      sessionId: rev.runner.sessionId, agent: cfg.reviewerAgent, kind: "review",
+      startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
+    });
+    const revRes = await rev.runner.awaitCompletion(5 * 60_000);
+    const verdict = parseVerdict(revRes.output);
+    const revUsage = await this.collectUsage(rev.runner);
+    await this.store.finishAttempt(task.id, revAttempt.id, {
+      outcome: verdict?.verdict === "approve" ? "approved" : "rejected",
+      summary: verdict?.summary ?? truncate(revRes.output, 500),
+      evidence: {
+        verdict: verdict?.verdict ?? "unparseable",
+        findings: JSON.stringify(verdict?.findings ?? []),
+        ...(revUsage ? { tokens: JSON.stringify(revUsage) } : {}),
+      },
+    });
+    return { verdict };
   }
 
   private async executeTask(task: Task): Promise<void> {
@@ -349,24 +378,22 @@ export class Orchestrator {
       const validatorOk = validators.every((v) => v.code === 0 && !v.timedOut);
 
       // --- independent review ---
-      const rev = await this.dispatch("reviewer", task);
-      this.supervisor.unregister(task.id); // reviewer is short; keep supervision on coder path only
-      const revAttempt = await this.store.addAttempt(task.id, {
-        sessionId: rev.runner.sessionId, agent: cfg.reviewerAgent, kind: "review",
-        startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
-      });
-      const revRes = await rev.runner.awaitCompletion(5 * 60_000);
-      const verdict = parseVerdict(revRes.output);
-      const revUsage = await this.collectUsage(rev.runner);
-      await this.store.finishAttempt(task.id, revAttempt.id, {
-        outcome: verdict?.verdict === "approve" ? "approved" : "rejected",
-        summary: verdict?.summary ?? truncate(revRes.output, 500),
-        evidence: {
-          verdict: verdict?.verdict ?? "unparseable",
-          findings: JSON.stringify(verdict?.findings ?? []),
-          ...(revUsage ? { tokens: JSON.stringify(revUsage) } : {}),
-        },
-      });
+      let review = await this.runReview(task);
+      // Bounded re-ask: an unparseable verdict with passing validators is a
+      // review-format failure, not a code failure — never spend a coder
+      // attempt on it (benchmark run-mvb2ysid burned two full coder attempts
+      // on reviewers that answered in prose instead of the required JSON)
+      let reviewReasks = 0;
+      while (!review.verdict && validatorOk && reviewReasks < cfg.recovery.maxReviewReasks) {
+        reviewReasks++;
+        await this.store.decide({
+          by: "orchestrator", kind: "technical",
+          text: `Review of attempt ${attemptNo} returned no parseable verdict; re-asking the reviewer (${reviewReasks}/${cfg.recovery.maxReviewReasks})`,
+          rationale: "validators pass and the code is unchanged — a review-format failure must not consume a coder attempt",
+        });
+        review = await this.runReview(task, true);
+      }
+      const verdict = review.verdict;
       if (!validatorOk || verdict?.verdict !== "approve") {
         refined = [
           `Previous attempt rejected. Validator results: ${validators.map((v) => `${v.name}=${v.code}`).join(", ")}.`,

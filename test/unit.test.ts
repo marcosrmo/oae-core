@@ -686,6 +686,80 @@ test("large requests still use the model planner", async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("unparseable review with passing validators is re-asked, not re-coded (run-mvb2ysid regression)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-reask", "prose then json");
+    const reviewers = [
+      new FakeRunner("s-rev-prose", { type: "complete", output: "Verification complete. All checks pass: the diff is correct and the validator exited 0." }),
+      new FakeRunner("s-rev-json", { type: "complete", output: REVIEWER_OK }),
+    ];
+    let revIdx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : reviewers[revIdx++]!),
+    });
+    const { state } = await orch.run("prose then json");
+    assert.equal(state.status, "done", `summary: ${state.summary}`);
+    const task = state.tasks[0];
+    assert.equal(task.attempts.filter((a) => a.kind === "code").length, 1, "no coder attempt spent on a review-format failure");
+    assert.equal(task.attempts.filter((a) => a.kind === "review").length, 2, "one review + one re-ask");
+    assert.ok(reviewers[1]!.prompts[0].includes("ENTIRE reply must be exactly ONE JSON object"), "re-ask carries the format reminder");
+    assert.ok(state.decisions.some((d) => d.text.includes("re-asking the reviewer")), "re-ask decision recorded");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("review re-asks are bounded: persistent prose falls back to coder rework", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-reask2", "always prose");
+    const reviewers = [
+      new FakeRunner("s-p1", { type: "complete", output: "prose: everything looks fine" }),
+      new FakeRunner("s-p2", { type: "complete", output: "more prose, still no JSON" }),
+      new FakeRunner("s-p3", { type: "complete", output: REVIEWER_OK }),
+    ];
+    let revIdx = 0;
+    let codeDispatches = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder"
+        ? (codeDispatches++, FACTORY_OK_CODER())
+        : reviewers[revIdx++]!),
+    });
+    const { state } = await orch.run("always prose");
+    assert.equal(state.status, "done");
+    assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "code").length, 2, "fell back to a coder rework attempt after the bounded re-ask");
+    assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "review").length, 3);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("maxReviewReasks=0 preserves the legacy behavior (unparseable review goes straight to rework)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxReviewReasks = 0;
+    const store = await Store.create(dir, "run-noreask", "legacy path");
+    const reviewers = [
+      new FakeRunner("s-np1", { type: "complete", output: "prose only" }),
+      new FakeRunner("s-np2", { type: "complete", output: REVIEWER_OK }),
+    ];
+    let revIdx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : reviewers[revIdx++]!),
+    });
+    const { state } = await orch.run("legacy path");
+    assert.equal(state.status, "done");
+    assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "review").length, 2, "no re-ask when disabled");
+    assert.ok(!state.decisions.some((d) => d.text.includes("re-asking the reviewer")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("supervisor does not diagnose while progress is recent", async () => {
   const dir = await makeProject();
   try {
