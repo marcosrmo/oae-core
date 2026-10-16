@@ -159,7 +159,7 @@ Comandos que **existem** hoje (CLI em `src/index.ts`):
 
 | Comando | Descrição | Opções |
 | --- | --- | --- |
-| `oae run "<request>"` | Executa uma missão completa | `--dir`, `--model`, `--dry-run`, `--concurrency`, `--force` |
+| `oae run "<request>"` | Executa uma missão completa | `--dir`, `--model`, `--dry-run`, `--concurrency`, `--force`, `--quiet` |
 | `oae plan "<request>"` | Só planeja (dry run), imprime as tarefas em JSON | `--dir`, `--model` |
 | `oae status` | Tabela de tarefas + status do run | `--dir` |
 | `oae report` | Relatório final baseado em evidências (texto) | `--dir` |
@@ -187,6 +187,31 @@ O `dashboard` é **determinístico**: todas as linhas são montadas a partir de
 `--follow` relê apenas os arquivos locais a cada 1 s. `Ctrl+C` encerra o painel
 (comportamento padrão do Node — nenhum listener de sinal é registrado). Cores ANSI só em
 TTY real; em pipe/CI a saída é texto limpo.
+
+### Progresso ao vivo durante `oae run`
+
+`oae run` imprime **progresso em tempo real no stderr** enquanto trabalha — uma linha por
+evento realmente persistido, com timestamp, estado e escopo (tarefa#tentativa):
+
+```
+[13:08:19Z] [planning]    run started — make the CLI installable (model openrouter/z-ai/glm-5.3-flash)
+[13:08:19Z] [running]     plan ready — 1 task(s)
+[13:08:19Z] [waiting]     task-1#1   attempt 1 dispatched (agent build, kind code) — waiting for the session
+[13:09:10Z] [validating]  validator typecheck: exit=0 — ok
+[13:12:00Z] [completed]   run finished: done — 1/1 tasks completed
+```
+
+Estados: `planning`, `running`, `waiting`, `validating`, `recovering`, `interrupted`,
+`failed`, `completed` (mais `info`/`unknown` para eventos neutros ou não reconhecidos).
+
+- O **stdout** permanece apenas o relatório final — `oae run > report.md` é seguro.
+- **Sem mensagens artificiais**: sem evento, sem linha. Silêncio é silêncio real, nunca um
+  "provavelmente ainda trabalhando"; a última linha sempre corresponde a um evento gravado.
+- Atividade do agente é limitada (throttle por tentativa) para não virar tempestade de logs;
+  mensagens passam por redação de credenciais. `--quiet` desliga o feed.
+- **Não existe canal de eventos em tempo real para a TUI do OpenCode v2.0.29.** Para
+  acompanhar de dentro de uma sessão, rode em background e faça *polling* limitado de
+  `oae status`/`oae dashboard` (a skill `oae` documenta a receita).
 
 ### Eventos, estado, transcrição e telemetria — o que é o quê
 
@@ -376,12 +401,19 @@ Detalhes completos em [`docs/SECURITY.md`](docs/SECURITY.md) e
 A prioridade é **confiabilidade da execução → observabilidade ponta a ponta → recuperação
 segura**, antes de prometer autonomia total.
 
+**Concluído (Fase 0 e Fase V):**
+
+- [x] finalização de estado em saída anômala do processo e reconciliação de execuções órfãs
+      (`oae status`/`dashboard` projetam `interrupted`; `oae reconcile` persiste, preservando
+      o histórico);
+- [x] progresso ao vivo no terminal durante o run (`oae run` imprime eventos reais no stderr;
+      `--quiet` desliga).
+
 **Próximo (v0.2) — planejado:**
 
 - [ ] retomada de run: `oae resume` continuando um run interrompido a partir de `.oae/state.json`;
-- [ ] finalização de estado em saída anômala do processo (evitar `running` congelado após crash);
 - [ ] tarefas em paralelo com worktrees por tarefa;
-- [ ] progresso ao vivo no terminal durante o run.
+- [ ] papéis adaptativos (Tester/Integrator determinísticos) e seleção de modelo por papel.
 
 **Depois — planejado:**
 

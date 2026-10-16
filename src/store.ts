@@ -117,8 +117,26 @@ export class Store {
     await writeJsonAtomic(this.file, this.state);
   }
 
+  /**
+   * Live event subscribers (Fase V). A subscriber is called AFTER the event is
+   * appended, so observers always see what was actually persisted. No
+   * subscriber ⇒ zero behavioural change (the CLI's progress feed is the only
+   * production subscriber). A throwing subscriber is swallowed: observation
+   * must never break a run.
+   */
+  private listeners: Array<(rec: Record<string, unknown>) => void> = [];
+
+  onEvent(fn: (rec: Record<string, unknown>) => void): () => void {
+    this.listeners.push(fn);
+    return () => { this.listeners = this.listeners.filter((l) => l !== fn); };
+  }
+
   async event(kind: string, data: Record<string, unknown>): Promise<void> {
-    await appendJsonl(this.eventsFile, { ...data, at: nowISO(), kind });
+    const rec: Record<string, unknown> = { ...data, at: nowISO(), kind };
+    await appendJsonl(this.eventsFile, rec);
+    for (const l of this.listeners) {
+      try { l(rec); } catch { /* observation must never break the run */ }
+    }
   }
 
   task(id: string): Task {
@@ -156,7 +174,7 @@ export class Store {
     t.attempts.push(attempt);
     t.updatedAt = nowISO();
     await this.persist();
-    await this.event("attempt_added", { taskId, attemptId: attempt.id, attemptKind: a.kind, outcome: a.outcome });
+    await this.event("attempt_added", { taskId, attemptId: attempt.id, attemptKind: a.kind, outcome: a.outcome, agent: a.agent, sessionId: attempt.sessionId });
     return attempt;
   }
 
@@ -189,7 +207,7 @@ export class Store {
     const dec: Decision = { ...d, id: "dec-" + (this.state.decisions.length + 1), at: nowISO() };
     this.state.decisions.push(dec);
     await this.persist();
-    await this.event("decision", { decisionId: dec.id, kind: dec.kind, by: dec.by });
+    await this.event("decision", { decisionId: dec.id, decisionKind: dec.kind, by: dec.by });
     return dec;
   }
 

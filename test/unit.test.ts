@@ -19,6 +19,7 @@ import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
+import { createProgressReporter, progressFrame, progressLine, redact } from "../src/progress.ts";
 import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type AgentRunResult, type ProgressSignal } from "../src/opencode.ts";
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
@@ -730,6 +731,176 @@ test("CLI: `oae status` reports the effective status and `oae reconcile` persist
     const after = JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as RunState;
     assert.equal(after.status, "interrupted");
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/** Fase V — one event shape for the progress-feed tests (OaeEvent-compatible). */
+const evt = (kind: string, data: Record<string, unknown> = {}, at = "2026-10-16T13:08:19.000Z"): { at: string; kind: string; [k: string]: unknown } => ({ at, kind, ...data });
+
+test("progress feed: real events render ordered, timestamped lines with task/attempt scope", () => {
+  const lines: string[] = [];
+  const report = createProgressReporter({ colors: false, write: (s) => lines.push(s), now: () => 0 });
+  for (const e of [
+    evt("run_started", { request: "make the CLI installable", model: "openrouter/z-ai/glm-5.3-flash" }, "2026-10-16T13:03:17.649Z"),
+    evt("plan_ready", { tasks: 1 }, "2026-10-16T13:08:19.825Z"),
+    evt("task_added", { taskId: "task-1", title: "installable CLI" }, "2026-10-16T13:08:19.824Z"),
+    evt("task_updated", { taskId: "task-1", status: "in_progress" }, "2026-10-16T13:08:19.827Z"),
+    evt("attempt_added", { taskId: "task-1", attemptId: 1, attemptKind: "code", agent: "build", outcome: "running" }, "2026-10-16T13:08:19.933Z"),
+    evt("validator", { name: "typecheck", code: 0, timedOut: false }, "2026-10-16T13:09:10.000Z"),
+    evt("attempt_finished", { taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "completed", elapsedMs: 50_000 }, "2026-10-16T13:09:10.500Z"),
+    evt("run_finished", { status: "done", summary: "1/1 tasks completed" }, "2026-10-16T13:12:00.000Z"),
+  ]) report(e);
+
+  assert.equal(lines.length, 8, "exactly one line per real event");
+  const L = lines.map((l) => l.trimEnd()); // the reporter terminates every line with "\n"
+  assert.match(L[0]!, /^\[13:03:17Z\] \[planning\]\s+run started — make the CLI installable \(model openrouter\/z-ai\/glm-5\.3-flash\)$/);
+  assert.match(L[1]!, /^\[13:08:19Z\] \[running\]\s+plan ready — 1 task\(s\)/);
+  assert.match(L[2]!, /^\[13:08:19Z\] \[planning\]\s+task-1\s+task added: installable CLI$/);
+  assert.match(L[4]!, /^\[13:08:19Z\] \[waiting\]\s+task-1#1\s+attempt 1 dispatched \(agent build, kind code\) — waiting for the session$/);
+  assert.match(L[5]!, /^\[13:09:10Z\] \[validating\]\s+validator typecheck: exit=0 — ok$/);
+  assert.match(L[6]!, /attempt 1 \(code\) → completed \[50s\]$/);
+  assert.match(L[7]!, /^\[13:12:00Z\] \[completed\]\s+run finished: done — 1\/1 tasks completed$/);
+  // non-interactive safety: no ANSI when colors are off
+  assert.ok(lines.every((l) => !l.includes("\x1b[")), "CI-safe output");
+});
+
+test("progress feed: every requested state is reachable from real events", () => {
+  const states = new Set<string>([
+    progressFrame(evt("run_started", { request: "x" })).state,
+    progressFrame(evt("plan_ready", { tasks: 1 })).state,
+    progressFrame(evt("agent_progress", { detail: "x" })).state,
+    progressFrame(evt("attempt_added", { taskId: "t", attemptId: 1 })).state,
+    progressFrame(evt("validator", { name: "n", code: 0 })).state,
+    progressFrame(evt("retry_scheduled", { reason: "r" })).state,
+    progressFrame(evt("run_reconciled", { from: "running", to: "interrupted" })).state,
+    progressFrame(evt("provider_error", { message: "m" })).state,
+    progressFrame(evt("run_finished", { status: "done" })).state,
+    progressFrame(evt("brand_new_kind")).state,
+  ]);
+  for (const s of ["planning", "running", "waiting", "validating", "recovering", "interrupted", "failed", "completed", "unknown"]) {
+    assert.ok(states.has(s), `state ${s} must be reachable from the event taxonomy`);
+  }
+});
+
+test("progress feed: failure, interruption and recovery are distinct, evidence-based states", () => {
+  const frames = [
+    progressFrame(evt("provider_error", { httpStatus: 429, message: "Provider request failed with HTTP 429" })),
+    progressFrame(evt("provider_error", { httpStatus: 401, message: "authorization header missing" })),
+    progressFrame(evt("retry_scheduled", { taskId: "t", attemptNo: 1, reason: "provider unavailable", waitMs: 30_000 })),
+    progressFrame(evt("session_interrupted", { taskId: "t", attemptId: 1 })),
+    progressFrame(evt("supervisor_diagnose", { taskId: "t", idleMs: 420_000 })),
+    progressFrame(evt("supervisor_quarantine", { taskId: "t" })),
+    progressFrame(evt("run_reconciled", { from: "running", to: "interrupted", reason: "owner pid 4984 is not alive" })),
+    progressFrame(evt("run_finished", { status: "failed" })),
+    progressFrame(evt("attempt_finished", { taskId: "t", attemptId: 1, attemptKind: "code", outcome: "interrupted", elapsedMs: 1000 })),
+  ];
+  assert.deepEqual(frames.map((f) => f.state), [
+    "failed", "failed", "recovering", "recovering", "recovering", "failed", "interrupted", "failed", "failed",
+  ]);
+  assert.ok(frames[0]!.message.includes("HTTP 429"), "provider status surfaced");
+  assert.ok(frames[1]!.message.includes("HTTP 401"), "auth failure surfaced distinctly");
+  assert.ok(frames[2]!.message.includes("waiting 30s"), "backoff visible");
+  assert.ok(frames[4]!.message.includes("420s"), "diagnosis idle time visible");
+  assert.ok(frames[6]!.message.includes("running → interrupted"), "reconciliation reason visible");
+});
+
+test("progress feed: no fabricated activity — the feed is strictly event-driven and stops cleanly", async () => {
+  const dir = await makeProject();
+  try {
+    const store = await Store.create(dir, "run-quiet", "demo");
+    const lines: string[] = [];
+    const off = store.onEvent(createProgressReporter({ colors: false, write: (s) => lines.push(s), now: () => 0 }));
+
+    // nothing happens → nothing is printed (no timer, no heartbeat)
+    await sleep(30);
+    assert.equal(lines.length, 0, "silence must never produce an invented 'still working' line");
+
+    await store.event("run_started", { request: "x" });
+    assert.equal(lines.length, 1);
+    assert.match(lines[0]!, /\[planning\]/);
+
+    // bounded observation: unsubscribing stops the feed immediately…
+    off();
+    await store.event("plan_ready", { tasks: 1 });
+    assert.equal(lines.length, 1, "after unsubscribe no further line is written");
+    // …while persistence continues (the feed observes, it does not write)
+    const persisted = (await readFile(join(dir, ".oae", "events.jsonl"), "utf8")).trim().split(/\r?\n/);
+    assert.equal(persisted.length, 2);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("progress feed: agent activity is throttled, but a different attempt is never silenced", () => {
+  const lines: string[] = [];
+  let clock = 0;
+  const report = createProgressReporter({ colors: false, write: (s) => lines.push(s), now: () => clock, throttleMs: 2000 });
+  const activity = (ms: number, attemptId: number) => {
+    clock = ms;
+    report(evt("agent_progress", { taskId: "t", attemptId, signalKind: "tool", detail: `messages=${ms}` }));
+  };
+  activity(0, 1); activity(100, 1); activity(200, 1); activity(1999, 1); activity(2000, 1); activity(2500, 1);
+  assert.equal(lines.length, 2, "only frames at least throttleMs apart are printed");
+  activity(2100, 2);
+  assert.equal(lines.length, 3, "each attempt has its own throttle window");
+  assert.match(lines[0]!, /t#1\s+agent activity: messages=0/);
+  assert.match(lines[2]!, /t#2\s+agent activity: messages=2100/);
+});
+
+test("progress feed: credentials never reach the terminal", () => {
+  const out = progressLine(evt("provider_error", {
+    httpStatus: 429, taskId: "task-1", attemptId: 1,
+    message: "Provider request failed with HTTP 429: Authorization: Bearer sk-live-abcdef1234567890",
+  }));
+  assert.ok(!out.line.includes("sk-live-abcdef1234567890"), `token leaked: ${out.line}`);
+  assert.ok(out.line.includes("[redacted]"));
+  assert.equal(redact("api_key=abcdefgh12345678"), "api_key=[redacted]");
+  assert.equal(redact("ghp_abcdefgh12345678"), "[redacted]");
+  assert.equal(redact("github_pat_abcdefgh12345678"), "[redacted]");
+  assert.equal(redact("a normal message about tokens"), "a normal message about tokens");
+});
+
+test("progress feed + dashboard + store stay consistent on a real (fake-agent) run", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-live", "add hello module");
+    const lines: string[] = [];
+    const off = store.onEvent(createProgressReporter({ colors: false, write: (s) => lines.push(s), now: () => 0 }));
+    const orch = new Orchestrator(null, store, {
+      config, plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+    });
+    const { state } = await orch.run("add hello module");
+    off();
+    assert.equal(state.status, "done");
+
+    const kinds = (await readFile(join(dir, ".oae", "events.jsonl"), "utf8")).trim().split(/\r?\n/)
+      .map((l) => (JSON.parse(l) as { kind: string }).kind);
+    for (const k of ["run_started", "plan_ready", "task_added", "attempt_added", "validator", "attempt_finished", "run_finished"]) {
+      assert.ok(kinds.includes(k), `lifecycle event ${k} must be recorded`);
+    }
+    // the live feed renders exactly one line per persisted event (no invention,
+    // no omission) — FakeRunner emits no agent_progress, so nothing is throttled
+    assert.equal(lines.length, kinds.length, "feed lines must mirror persisted events 1:1");
+    const joined = lines.join("\n");
+    for (const tag of ["[planning]", "[running]", "[validating]", "[completed]"]) {
+      assert.ok(joined.includes(tag), `${tag} must be visible during the run`);
+    }
+
+    // and the dashboard still renders the same run: no compatibility break
+    const view = await loadRunView(dir, { nowMs: Date.now() });
+    assert.ok(view);
+    assert.equal(view!.status, "done");
+    assert.equal(view!.phase, "concluída");
+    assert.ok(renderSummary(view!, { width: 80 }).includes("concluída"), "the panel shows the completed phase");
+    assert.ok(renderResultLine(view!, { colors: false }).includes("CONCLUÍDA"), "and the completed result line");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("progress feed: model and agent selection is reported from real data", () => {
+  const started = progressFrame(evt("run_started", { request: "x", model: "openrouter/z-ai/glm-5.3-flash", agents: { coder: "build" } }));
+  assert.ok(started.message.includes("openrouter/z-ai/glm-5.3-flash"), "the resolved model is shown, not a guess");
+  const dispatched = progressFrame(evt("attempt_added", { taskId: "t", attemptId: 2, attemptKind: "review", agent: "oae-reviewer" }));
+  assert.ok(dispatched.message.includes("oae-reviewer"), "the agent actually used is shown");
+  assert.ok(dispatched.message.includes("kind review"));
 });
 
 test("anti-recursion: dispatched prompts forbid launching nested runs", async () => {

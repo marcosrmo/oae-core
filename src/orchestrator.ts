@@ -111,7 +111,14 @@ export class Orchestrator {
   async run(request: string): Promise<{ state: RunState }> {
     const cfg = this.opts.config;
     const started = Date.now();
-    await this.store.event("run_started", { request: truncate(request, 300) });
+    await this.store.event("run_started", {
+      request: truncate(request, 300),
+      // real selection, recorded once: model resolved at runtime (D9) and the
+      // agent names actually used for each role
+      model: cfg.model ? `${cfg.model.providerID}/${cfg.model.id}` : "service default",
+      agents: { planner: cfg.plannerAgent, coder: cfg.coderAgent, reviewer: cfg.reviewerAgent },
+      concurrency: cfg.concurrency,
+    });
 
     // git: inspect and prepare (never discards user work)
     const prep = await git.prepareGit(cfg.projectDir);

@@ -27,6 +27,7 @@ import { checkRemote, publish } from "./publish.ts";
 import { installIntoProject } from "./setup.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "./runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "./reconcile.ts";
+import { createProgressReporter } from "./progress.ts";
 import { loadRunView } from "./viewmodel.ts";
 import { renderSummary, renderResultLine, type RenderOptions } from "./dashboard.ts";
 import { listRunHistory, type HistoryEntry } from "./history.ts";
@@ -80,6 +81,7 @@ async function main(): Promise<number> {
       // the run must NEVER leave state.json stuck at "running" for a process
       // that no longer exists — that is exactly how run-mvazafl3 became orphaned.
       let store: Store | undefined;
+      let unsubscribe: (() => void) | undefined;
       let finalized = false;
       const finalize = async (reason: string): Promise<void> => {
         if (finalized) return; // idempotent: catch path and signal path can both fire
@@ -106,6 +108,12 @@ async function main(): Promise<number> {
           console.log(`(oae-reviewer agent + skills installed into ${dir})`);
         }
         store = await Store.create(dir, runId, request);
+        // Fase V: live progress for humans. It is driven by REAL persisted
+        // events (the subscriber runs after each append) and goes to stderr, so
+        // stdout stays the final report; `--quiet` turns it off for scripts.
+        if (!flag("--quiet", argv)) {
+          unsubscribe = store.onEvent(createProgressReporter({ colors: isTTY }));
+        }
         const { client } = await connect();
         const orch = new Orchestrator(client, store, { config, dryRun: flag("--dry-run", argv) });
         const { state } = await orch.run(request);
@@ -118,6 +126,7 @@ async function main(): Promise<number> {
         await finalize(`run() threw: ${String((e as Error)?.message ?? e)}`);
         throw e;
       } finally {
+        unsubscribe?.();
         process.removeListener("SIGINT", onInt);
         process.removeListener("SIGTERM", onTerm);
         process.removeListener("uncaughtException", onUncaught);

@@ -297,3 +297,51 @@ reconciliation, idempotency, live-owner/no-lock conservatism, read-only
 projection, in-process finalize, foreign-lock protection, CLI wiring). No
 provider calls. The preserved `run-mvazafl3` was reconciled by this mechanism
 (`running → interrupted`, snapshot archived) without deleting any evidence.
+
+## D18 — Live progress feed for `oae run` (Fase V)
+
+**Problem.** A run printed nothing until its final report: from the terminal,
+`planning`, `running`, `validating` and `recovering` all looked identical —
+silence. That is exactly the "is it stuck?" ambiguity reported in the Fase 0
+diagnosis (where the truth happened to be an orphaned process).
+
+**Decision.** Render the EXISTING event taxonomy (D16) to the terminal while the
+run works.
+
+- **One seam.** `Store.onEvent(fn)` notifies subscribers *after* the append, so
+  the feed can only ever show what was actually persisted — there is no timer
+  and no heartbeat, and silence stays silence. No subscriber ⇒ zero behavioural
+  change (existing tests and the `status`/`report` paths are untouched).
+- **`src/progress.ts`** maps each kind to a state tag (`planning`, `running`,
+  `waiting`, `validating`, `recovering`, `interrupted`, `failed`, `completed`,
+  plus `info` for neutral notes and `unknown` for unrecognised kinds) and to a
+  message with timestamp and `task#attempt` scope. `attempt_added` is rendered
+  as `waiting` (dispatched, awaiting the session); the first real
+  `agent_progress` turns it into `running`. No new persisted state is invented.
+- **stderr, not stdout.** Humans see progress; `oae run > report.md` still
+  captures only the report. `--quiet` disables the feed for scripts. ANSI only
+  on a real TTY (CI-safe).
+- **Noise control.** `agent_progress` frames are throttled per attempt
+  (default 2 s, injectable clock) so a chatty session cannot storm the terminal,
+  while every lifecycle edge (dispatch, validator, review, retry, error,
+  completion) is always printed.
+- **Redaction.** Every rendered message passes through `redact()` — Bearer
+  tokens, `sk-`/`ghp_`/`github_pat_`/`xox*` keys, JWTs and `token=`/`api_key=`
+  assignments are masked before they can reach a terminal.
+
+**No push channel into the TUI.** OpenCode v2.0.29 offers no event stream into a
+chat session, so a mission is followed from a session by running it in the
+background and polling `oae status`/`oae dashboard` with a *bounded* loop (a few
+times per minute; local file reads, no service or provider calls). The `oae`
+skill documents this and states explicitly whether the agent is inside an OAE
+run or working directly in OpenCode.
+
+**Side fix.** `decision` events carried `kind` in the payload, which
+`Store.event`'s spread overwrote with the event type — the panel rendered
+`decision [decision]`. The payload field is now `decisionKind` (additive;
+`evLabel` falls back for old logs).
+
+**Validation.** 61/61 deterministic unit tests (8 new: ordering/content,
+state reachability, failure/interruption/recovery, no-fake-activity +
+unsubscribe, throttling, redaction, feed↔log 1:1 on a full fake-agent run,
+model/agent reporting). No provider calls.

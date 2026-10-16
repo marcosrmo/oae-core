@@ -219,7 +219,7 @@ function evLabel(kind: string, ev: OaeEvent, attemptAgent: Map<string, string>):
     case "session_interrupted": return `session interrupted (attempt ${str(ev.attemptId)})`;
     case "retry_scheduled": return `retry scheduled: ${(str(ev.reason) ?? "").slice(0, 70)} (wait ${Math.round((num(ev.waitMs) ?? 0) / 1000)}s)`;
     case "validator": return `validator ${str(ev.name)}: exit=${str(ev.code)}${ev.timedOut ? " (TIMED OUT)" : ""}`;
-    case "decision": return `decision [${str(ev.kind)}] by ${str(ev.by)}`;
+    case "decision": return `decision [${str(ev.decisionKind) ?? str(ev.kind)}] by ${str(ev.by)}`;
     case "supervisor_diagnose": return `supervisor diagnosis: task ${str(ev.taskId)} idle ${Math.round((num(ev.idleMs) ?? 0) / 1000)}s`;
     case "supervisor_recover": return `supervisor recovery: task ${str(ev.taskId)} idle ${Math.round((num(ev.idleMs) ?? 0) / 1000)}s`;
     case "supervisor_quarantine": return `supervisor quarantine: task ${str(ev.taskId)}`;
