@@ -5,12 +5,14 @@
   "type": "module",
   "private": true,
   "engines": { "node": ">=24.0.0" },
-  "bin": { "oae": "./src/index.ts" },
+  "bin": { "oae": "./dist/index.js" },
   "files": [
-    "src",
+    "dist",
     "skills"
   ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
     "test": "node --test test/unit.test.ts",
     "test:unit": "node --test test/unit.test.ts",
     "test:integration": "node --test --test-timeout 900000 test/integration.test.ts",
