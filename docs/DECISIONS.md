@@ -159,11 +159,14 @@ supersede older ones; superseded entries are kept for context.
 - **CLI status semantics kept:** `oae status` with no prior state prints
   `no runs found` and exits 1 — unix precedent (`grep` on no match);
   scripts must treat exit 1 as "no state yet", not an internal error.
-- **Provider rate-limit incident (benchmark `run-mvb4b2ov`):** after a day
-  of heavy use of `nvidia/z-ai/glm-5.3`, all 3 coder attempts failed with
-  HTTP 429 (0 tokens each, ~87 s of service-internal retries before the
-  first OAE attempt failed). Existing bounds behaved correctly (bounded
-  retries, transparent report) but attempt budget *is* consumed by
-  provider errors; a structured 429-aware backoff that does not spend
-  attempts is recorded as future work (EFFICIENCY_AUDIT §6). Not
-  implemented without a reproducible test.
+- **Provider rate-limit incident (benchmarks `run-mvb4b2ov` and
+  `run-mvb4xohu`):** after a day of heavy use of `nvidia/z-ai/glm-5.3`,
+  every coder attempt across both runs failed with HTTP 429 (one further
+  attempt failed with HTTP 401 "authorization header missing",
+  coinciding with a confirmed OpenCode service restart), 0 tokens per
+  attempt. Existing bounds behaved correctly (bounded retries, transparent
+  report) but attempt budget *is* consumed by provider errors; a
+  structured 429-aware backoff that does not spend attempts is recorded as
+  future work (EFFICIENCY_AUDIT §6). Not implemented without a
+  reproducible test. Benchmarking was deliberately stopped after the
+  second confirmation.

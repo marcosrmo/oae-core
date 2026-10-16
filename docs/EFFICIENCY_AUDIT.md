@@ -251,6 +251,17 @@ not a loop defect (the same day had already spent 30+ sessions on
   here — no deterministic/reproducible test without hammering the same
   rate-limited provider further.
 
+A fourth run after a 12-minute cooldown (`run-mvb4xohu`) confirmed the
+constraint is external and persistent: 2 more attempts failed with HTTP
+429 and the third with **HTTP 401 "authorization header missing"**,
+coinciding with a confirmed restart of the OpenCode service during the
+wait window. No model call completed either run (0 tokens per attempt).
+Further benchmark attempts were deliberately stopped — retrying an
+exhausted provider only burns the attempt quota again. Live validation of
+fix 10 was therefore not possible in this session (every attempt died at
+the coder step, before any review); its coverage is the 3 deterministic
+unit tests, and *that* is what §7.1 reports.
+
 ## 6. Proposed architecture (not yet implemented)
 
 **A. Minimal reusable context.** Split context into (1) stable project
@@ -317,5 +328,19 @@ behavior).
 
 ## 7.1 After fix #10 (reviewer re-ask)
 
-Third identical run (`run-mv…bench3`) validates fixes #1–10 end-to-end —
-filled in after the run completes.
+No third live "after" data point was produced. Benchmarks `run-mvb4b2ov`
+(immediately after bench 2) and `run-mvb4xohu` (after a 12-minute
+cooldown) both failed **before reaching any review** — HTTP 429 on the
+coder step (and one HTTP 401 coinciding with an OpenCode service restart),
+0 tokens per attempt (§5.3). The instruction-independent observations
+gained from live runs are unchanged and complete:
+
+- fixes 1–9 validated live in bench 1/2 (planner skip, IMPEDIMENT fix,
+  telemetry, transcript cache, deadline interrupt);
+- fix 10 is validated by 3 deterministic unit tests (regression cases
+  mirroring run-mvb2ysid) — its live demonstration is **blocked by
+  provider quota exhaustion**, not by any loop defect;
+- observed provider behavior across the day: bench2's reviewer wrote prose
+  2/3 times (nondeterministic instruction-following); the same model
+  later returned 429 for ~4h+. Both are data about the *provider*, not
+  the OAE loop.
