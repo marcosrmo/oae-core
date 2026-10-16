@@ -130,3 +130,40 @@ supersede older ones; superseded entries are kept for context.
      interval 5s.
 - **Rationale:** every fix maps to a measured failure mode in
   docs/EFFICIENCY_AUDIT.md; each is covered by a dedicated unit test.
+
+## D15 — Post-benchmark loop fixes 7–10 and the installable CLI (2026-10-16)
+- **Fixes 7–9** (commit `22ffe49`, exposed by benchmark `run-mvb27epc`):
+  IMPEDIMENT extraction strips markdown emphasis; `interrupt()` invalidates
+  the transcript cache; model planning skipped for requests < 200 chars
+  (`PLANNER_MODEL_MIN_REQUEST`).
+- **Fix 10** (commit `e0c7ce2`, exposed by benchmark `run-mvb2ysid`): a
+  reviewer verdict that is *unparseable* while the validators pass is a
+  review-format failure → one bounded re-ask to the reviewer with a format
+  reminder (`config.recovery.maxReviewReasks`, default 1), never spending a
+  coder attempt on it. Benchmark evidence: 2 of 3 reviews answered in
+  prose with no JSON object anywhere in the output (verified in the
+  session context), costing 2 whole coder attempts on already-correct code.
+  A parser cannot recover output that is not there; re-asking is the
+  proven recovery. Legacy behavior preserved with `maxReviewReasks: 0`.
+- **Installable CLI** (commits `5b0fa06`, `311aae1`): the prefix-install
+  check that interrupted self-hosting run-mvazafl3 never reached proved a
+  `.ts` bin cannot run from `node_modules` — Node throws
+  `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` (v24.16.0). Resolution:
+  `tsconfig.build.json` emits `dist/` using `rewriteRelativeImportExtensions`
+  (5.7+); `bin` points at `dist/index.js`; `files: ["dist", "skills"]`;
+  `prepare: npm run build` runs on `npm pack` so the tarball ships built.
+  Verified end-to-end: pack (20 files) → `npm install --prefix` →
+  `node_modules/.bin/oae.cmd status --dir` → `no runs found`.
+  This supersedes D7's "no build step" for *installation only* — the
+  dev/repo workflow still runs `.ts` directly.
+- **CLI status semantics kept:** `oae status` with no prior state prints
+  `no runs found` and exits 1 — unix precedent (`grep` on no match);
+  scripts must treat exit 1 as "no state yet", not an internal error.
+- **Provider rate-limit incident (benchmark `run-mvb4b2ov`):** after a day
+  of heavy use of `nvidia/z-ai/glm-5.3`, all 3 coder attempts failed with
+  HTTP 429 (0 tokens each, ~87 s of service-internal retries before the
+  first OAE attempt failed). Existing bounds behaved correctly (bounded
+  retries, transparent report) but attempt budget *is* consumed by
+  provider errors; a structured 429-aware backoff that does not spend
+  attempts is recorded as future work (EFFICIENCY_AUDIT §6). Not
+  implemented without a reproducible test.

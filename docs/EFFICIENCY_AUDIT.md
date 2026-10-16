@@ -176,10 +176,80 @@ attribution per component. OpenCode's own service already exposes the data
 | 4 | Empty/blank coder output = failed attempt (decision recorded, **no reviewer session spent**), bounded by `maxAttempts` | §2.2 | "empty coder response is retried…", "all attempts empty: … zero review sessions" |
 | 5 | Per-attempt token telemetry (`runner.usage()` → `GET /api/session/{id}`) stored in `attempt.evidence.tokens` for coder and reviewer | §2.3 | "per-attempt token telemetry is recorded…" |
 | 6 | Completion path fetches the transcript once (cached from the poll) instead of three times; poll interval 2.5s → 5s | §2.4 | "…context is fetched once" |
+| 7 | `IMPEDIMENT` extraction strips markdown emphasis/bullets — a coder writing `**IMPEDIMENT:** none` no longer fakes a blocker (benchmark `run-mvb27epc` blocked a perfect, validator-passing task on this) | benchmark | "markdown-formatted 'IMPEDIMENT: none'…", "…real impediment still blocks…" |
+| 8 | `interrupt()` invalidates the transcript cache — a planner that finished 590s-0.01 before the deadline lost its plan to a 5s-stale cache | benchmark | "interrupt invalidates the transcript cache…" |
+| 9 | Model planning skipped for small requests (< 200 chars) — planner sessions cost up to 5 min critical-path latency and ~11K tokens, and small requests execute the deterministic plan anyway (2/3 measured planner sessions were pure waste) | §2.1 | "small requests skip the model planner…", "large requests still use the model planner" |
+| 10 | Bounded reviewer re-ask: when the verdict is unparseable **and** the validators pass, the reviewer is re-asked once with a hardened format reminder — no coder attempt is spent on a review-format failure (`config.recovery.maxReviewReasks`, default 1; `0` restores the legacy path) | §5.2 (benchmark `run-mvb2ysid`: 2 of 3 reviews had no JSON at all, burning 2 coder attempts on already-correct code) | "unparseable review with passing validators is re-asked…", "review re-asks are bounded…", "maxReviewReasks=0 preserves the legacy behavior" |
 
-All 22 unit tests pass (16 prior + 6 new), `tsc --noEmit` clean. Existing
+All 30 unit tests pass (16 prior + 14 new), `tsc --noEmit` clean. Existing
 protections (run lock, prompt guards, git baseline/branch, attempt limits,
 independent review) are covered by the prior 16 tests and unchanged.
+
+## 5.1 Bugs found by the benchmark itself (run-mvb27epc, first after-fix run)
+
+The first benchmark attempt (same task as the baseline) ran the fixed code
+and exposed three further defects, now fixed and tested (items 7–9 above):
+
+- telemetry worked (per-attempt tokens recorded: coder 1,617 in / 711 out /
+  306 reasoning / 33,728 cache-read), the coder finished in 71s with the
+  validator passing — and the task was **blocked anyway** because the coder's
+  markdown `- **IMPEDIMENT:** none` was parsed as the impediment `** none`;
+- the planner session finished 590 ms before its 5-minute deadline, but the
+  deadline path read a 5s-stale cached transcript and discarded the plan it
+  had just completed;
+- the planner still cost 5 minutes of critical-path latency for a 111-char
+  request that executed the deterministic plan anyway.
+
+## 5.2 Bugs found by benchmark 2 (run-mvb2ysid, second after-fix run)
+
+Same task, same model, fresh sandbox, main fixes active (planner skip worked:
+plan ready 1.1 s after run start). The run finished `done` with a valid
+commit — but took **19m04s** because of a new defect category, now fixed
+(item 10 above):
+
+- **Unparseable reviewer verdicts dominated the wall clock.** The reviewer
+  postscript requires a bare JSON object; the model (nvidia/z-ai/glm-5.3)
+  answered in prose 2 of 3 times — complete, positive reviews ("All checks
+  pass") with **no JSON object in the output at all** (verified against the
+  session context: review 1 quoted event-log fragments, review 2 had no
+  braces; neither contained a verdict). The old path treated every
+  unparseable verdict as a rejection and **burned a full coder attempt**,
+  even for code that the validators had already passed twice.
+- Anatomy of the wasted wall time: plan +1.1 s; code attempt 1 (2m10,
+  validator ok); review 1 rejected-unparseable (3m10); code attempt 2
+  (2m40, "made no edits — code already correct", validator ok); review 2
+  rejected-unparseable (5m01); code attempt 3 (3m46, again "no edits
+  needed"); review 3 approved (1m56). ~12 of the 19 minutes went to
+  review-format failures, not to engineering.
+- The per-attempt telemetry (fix 5) is what made this diagnosis possible:
+  all six attempts carry token counts (`evidence.tokens`), and the run
+  total is 26,825 in / 5,171 out / 9,624 reasoning / 255,872 cache-read
+  across coder and reviewer sessions.
+
+Fix 10 (bounded reviewer re-ask, commit `e0c7ce2`) exists because a parser
+improvement cannot recover output that is simply not there — the proven
+recovery is to re-ask the reviewer with the format reminder while the
+validators already pass, saving the coder attempt entirely.
+
+## 5.3 Benchmark 3 invalidated by provider rate limiting (run-mvb4b2ov)
+
+Third identical run (validating fixes 1–10): **failed with HTTP 429 Too
+Many Requests on all 3 coder attempts** — an external resource constraint,
+not a loop defect (the same day had already spent 30+ sessions on
+`nvidia/z-ai/glm-5.3` across the audit). Observed facts:
+
+- each attempt lasted ~87 s: the service retried the 429 internally before
+  surfacing the failure; OAE telemetry shows **0 tokens** for every
+  attempt (no model call ever completed);
+- the safety design worked exactly as specified: the provider error was
+  recorded verbatim per attempt, retry was bounded by `maxAttempts`, and
+  the run ended with an honest report (`0/1 tasks`, blocked reason
+  "attempt limit") instead of looping;
+- the planner threshold is still working (no planner session was created).
+- Future-work item (§6.E): structured provider-error classification with a
+  429-aware backoff that does not spend attempt budget. Not implemented
+  here — no deterministic/reproducible test without hammering the same
+  rate-limited provider further.
 
 ## 6. Proposed architecture (not yet implemented)
 
@@ -213,6 +283,10 @@ recorded; add: model-call/turn counts per attempt, per-run rollup in the
 final report, `--max-tokens` / `--max-model-calls` run limits with
 predictable stop (cancel in-flight sessions, mark run `failed: limit`), and
 planner-outcome events (`planner_model_used` / `planner_fallback:<reason>`).
+Also: structured provider-error classification — an HTTP 429 (or provider
+outage) should back off deterministically (e.g. 60s × attempt) without
+consuming the task's attempt budget, so a rate-limit window cannot kill a
+run whose work was never attempted (evidence: §5.3).
 
 **E. Safety.** All existing guarantees preserved by design — the changes
 above touch only how agents are driven and measured, never branch/baseline/
@@ -221,12 +295,27 @@ for crash recovery; `state.json` is crash-safe today (atomic writes).
 
 ## 7. Benchmark (same task before/after)
 
-Baseline (`run-mvayyizx`, before the fixes): sandbox "add sub()" — 6m09s,
-planner wasted (fallback), no telemetry recorded. After-fix re-run of the
-identical request in a fresh sandbox: see `docs/EFFICIENCY_AUDIT.md` §7
-results appended after the benchmark execution (same task, same model,
-same validators).
+All runs use the identical request ("add a sub(a,b) function …", 111
+chars) with the same model (nvidia/z-ai/glm-5.3), same validator
+(`node test.js`), and a fresh sandbox each time. Baseline (`run-mvayyizx`,
+before the fixes): 6m09s, planner wasted (fallback after a full planner
+session), no telemetry recorded. Costs are reported as tokens + wall time
+only — the nvidia provider reports `cost: 0`, so USD figures are not
+reliable in this environment (auditoria distinction: token telemetry is
+*observed*, per-attempt; anything else would be *documented* generic
+behavior).
 
-| Metric | Before (run-mvayyizx) | After (run-mvb…) |
-| --- | --- | --- |
-| (filled after the benchmark run) | | |
+| Metric | Before (run-mvayyizx) | After #1 (run-mvb27epc) | After #2 (run-mvb2ysid, fixes incl. #7–9) |
+| --- | --- | --- | --- |
+| Status | done → task blocked by false `IMPEDIMENT` | failed (attempt limit spent on the IMPEDIMENT bug) | **done**, valid commit `a871674` |
+| Wall time | 6m09s | 6m14s | 19m04s (12m of it on unparseable reviews) |
+| Planner | full 9-min session ran on, wasted (fallback plan) | session wasted (fallback) | **skipped** (< 200 chars) — plan at +1.1 s |
+| Code attempts | 1 | 1 (correct, but blocked by `**IMPEDIMENT:** none` bug) | 3 (attempts 2–3 made **no edits** — reviews were prose) |
+| Review outcome | approved first try | never reached | 2× unparseable prose, then approved |
+| Telemetry | none | per-attempt tokens ✓ | per-attempt tokens ✓ (6 attempts) |
+| Result | task not delivered | task not delivered | task delivered + committed |
+
+## 7.1 After fix #10 (reviewer re-ask)
+
+Third identical run (`run-mv…bench3`) validates fixes #1–10 end-to-end —
+filled in after the run completes.
