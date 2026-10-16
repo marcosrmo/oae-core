@@ -1,0 +1,23 @@
+{
+  "name": "opencode-autonomous-engineering",
+  "version": "0.1.0",
+  "description": "Reusable autonomous software engineering system built on the OpenCode v2 service API.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=24.0.0" },
+  "bin": { "oae": "./src/index.ts" },
+  "scripts": {
+    "test": "node --test test/unit.test.ts",
+    "test:unit": "node --test test/unit.test.ts",
+    "test:integration": "node --test --test-timeout 900000 test/integration.test.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "node src/index.ts"
+  },
+  "dependencies": {
+    "@opencode/client": "2.0.29"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

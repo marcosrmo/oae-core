@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.oae/
+dist/
+.env
+.env.*
+!.env.example
+# demo project is a self-contained sandbox with its own git history
+examples/demo-project/
