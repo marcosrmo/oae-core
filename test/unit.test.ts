@@ -12,6 +12,7 @@ import { Store, type RunState } from "../src/store.ts";
 import { Orchestrator, type RunOptions } from "../src/orchestrator.ts";
 import { loadConfig, type OaeConfig } from "../src/config.ts";
 import type { Plan } from "../src/planner.ts";
+import { makePlan } from "../src/planner.ts";
 import { FakeRunner, REVIEWER_OK, REVIEWER_REJECT } from "./fake.ts";
 import { renderReport } from "../src/report.ts";
 import { inspectGit } from "../src/git.ts";
@@ -589,6 +590,100 @@ test("runner start surfaces a rejected prompt instead of an empty success", asyn
     OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" }),
     /402 budget exceeded/,
   );
+});
+
+test("markdown-formatted 'IMPEDIMENT: none' is not a real impediment (run-mvb27epc regression)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-md-none", "bold none");
+    const coder = new FakeRunner("s-md", {
+      type: "complete",
+      output: "RESULT:\nfiles: src/hello.ts\n- **IMPEDIMENT:** none",
+    });
+    const reviewer = new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? coder : reviewer),
+    });
+    const { state } = await orch.run("bold none");
+    assert.equal(state.tasks[0].status, "done", "markdown emphasis must not fake an impediment");
+    assert.ok(state.tasks[0].commit, "the good change is committed");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("markdown-formatted real impediment still blocks with a cleaned reason", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-md-real", "bold real");
+    const coder = new FakeRunner("s-md2", {
+      type: "complete",
+      output: "RESULT:\n- **IMPEDIMENT:** missing database credentials for the integration test",
+    });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? coder : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+    });
+    const { state } = await orch.run("bold real");
+    const task = state.tasks[0];
+    assert.equal(task.status, "blocked");
+    assert.equal(task.blockedReason, "missing database credentials for the integration test");
+    assert.equal(task.attempts.filter((a) => a.kind === "review").length, 0, "no review session on a blocked task");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("interrupt invalidates the transcript cache: a plan finished right at the deadline is not lost", async () => {
+  const counters: { context?: number } = {};
+  const planText = '{"summary":"just in time","tasks":[{"id":"t1","title":"x","instructions":"i","dependsOn":[],"acceptance":["a"]}],"decisions":[]}';
+  const client = stubClient({
+    active: async () => ({ ses_stub: { type: "running" } }), // always busy -> deadline path
+    context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [
+      { type: "assistant", content: [{ type: "text", text: planText }] },
+    ] }; },
+  }, counters);
+  const runner = await OpenCodeRunner.start(client, {
+    directory: ".", title: "t", agent: "build", promptText: "p",
+  });
+  const res = await runner.awaitCompletion(0); // deadline already reached
+  assert.equal(res.outcome, "interrupted");
+  assert.equal(JSON.parse(res.output).summary, "just in time",
+    "final output after interrupt must be fetched fresh, not from the stale cache");
+  assert.equal(counters.context, 1, "exactly one fresh fetch after invalidation");
+});
+
+test("small requests skip the model planner entirely (no wasted session)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const boom: Client = {
+      session: {
+        create: async () => { throw new Error("planner session must not be created for small requests"); },
+      },
+    } as unknown as Client;
+    const plan = await makePlan(boom, config, "add a sub() function to index.js");
+    assert.equal(plan.tasks.length, 1, "deterministic single-task plan");
+    assert.ok(plan.summary.startsWith("Single-task fallback plan"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("large requests still use the model planner", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const planJson = { summary: "model plan", tasks: [{ id: "t1", title: "x", instructions: "i", dependsOn: [], acceptance: ["a"] }], decisions: [] };
+    const client = stubClient({
+      active: async () => ({}) as Record<string, unknown>, // idle on first poll -> completed
+      context: async () => ({ data: [
+        { type: "assistant", content: [{ type: "text", text: JSON.stringify(planJson) }] },
+      ] }),
+    });
+    const big = "restructure the authentication module across src/auth/*.ts ".repeat(10); // > 200 chars
+    const plan = await makePlan(client, config, big);
+    assert.equal(plan.summary, "model plan", "model-assisted plan is used for large requests");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {

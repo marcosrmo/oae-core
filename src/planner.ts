@@ -135,6 +135,14 @@ function fallbackPlan(request: string, stack: string, validators: { name: string
   };
 }
 
+/**
+ * Model planning is skipped for small requests: measured evidence (audit
+ * 2026-10-16) shows planner sessions cost up to 5 minutes of critical-path
+ * latency and ~11K tokens, and on small requests the deterministic plan is
+ * exactly what the run executes anyway. Larger requests keep the model.
+ */
+export const PLANNER_MODEL_MIN_REQUEST = 200;
+
 export async function makePlan(
   client: Client | null,
   config: OaeConfig,
@@ -142,7 +150,7 @@ export async function makePlan(
 ): Promise<Plan> {
   const stack = await detectStack(config.projectDir);
   const validators = config.validators.length > 0 ? config.validators : defaultValidators(config.projectDir, stack);
-  if (client) {
+  if (client && request.trim().length >= PLANNER_MODEL_MIN_REQUEST) {
     const p = await planWithModel(client, config, request, stack, validators).catch(() => undefined);
     if (p) return p;
   }

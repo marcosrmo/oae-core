@@ -238,6 +238,11 @@ export class OpenCodeRunner implements AgentRunner {
 
   async interrupt(): Promise<void> {
     this.interrupted = true;
+    // the session just changed state (stopped/finishing) — the cached
+    // transcript is stale; force one fresh fetch for final output/diagnosis
+    // (audit 2026-10-16: a planner finished 590ms before the deadline and its
+    // plan was lost to a 5s-stale cache)
+    this.lastCtx = null;
     try { await this.client.session.interrupt({ sessionID: this.sessionId }); } catch { /* already idle */ }
   }
 

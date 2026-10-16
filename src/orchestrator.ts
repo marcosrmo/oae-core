@@ -329,7 +329,13 @@ export class Orchestrator {
       }
       if (/IMPEDIMENT:/i.test(res.output)) {
         const imp = res.output.match(/IMPEDIMENT:[^\n]*/i)?.[0]?.trim() ?? "";
-        const real = imp.replace(/^IMPEDIMENT:\s*/i, "").trim();
+        // strip the label, then leading markdown emphasis/bullets/quotes
+        // (a coder writing "**IMPEDIMENT:** none" must not be read as an
+        // impediment named "** none" — benchmark run-mvb27epc)
+        const real = imp
+          .replace(/^IMPEDIMENT:\s*/i, "")
+          .replace(/^[\s*_`>#-]+/, "")
+          .trim();
         // treat anything starting with "none"/"no impediment"/"n/a" as no impediment
         if (real && !/^(none\b|n\/a\b|no impediment\b)/i.test(real)) {
           await this.store.updateTask(task.id, { status: "blocked", blockedReason: truncate(real, 300) });
