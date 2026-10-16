@@ -62,6 +62,36 @@ function fastRecovery(cfg: OaeConfig): OaeConfig {
   };
 }
 
+/** A stubbed SSE event client: each subscribe() call replays the next chunk
+ * (replaying the LAST chunk once the script is exhausted). A chunk with
+ * `reset: true` makes every next() reject (simulated transport drop). */
+type SseChunk = { events?: Array<{ type: string; data?: Record<string, unknown> }>; reset?: boolean };
+
+function stubEventClient(chunks: SseChunk[], over: Record<string, unknown> = {}, counters: Record<string, number> = {}): Client {
+  let attempt = 0;
+  const event = {
+    subscribe: () => {
+      counters.subscribe = (counters.subscribe ?? 0) + 1;
+      const chunk = chunks[Math.min(attempt++, chunks.length - 1)]! ?? {};
+      const evs = chunk.events ?? [];
+      return {
+        [Symbol.asyncIterator]() {
+          let i = 0;
+          return {
+            next: async (): Promise<IteratorResult<unknown>> => {
+              if (chunk.reset) throw new Error("stream reset");
+              const ev = i < evs.length ? evs[i++] : undefined;
+              return ev ? { value: ev, done: false as const } : { value: undefined, done: true as const };
+            },
+          };
+        },
+      } as AsyncIterable<unknown>;
+    },
+  };
+  const client = stubClient(over, counters as { interrupt?: number; context?: number });
+  return Object.assign(client, { event }) as unknown as Client;
+}
+
 function plan1(dir: string, task: Partial<Plan["tasks"][number]> = {}): Plan {
   return {
     summary: "test plan",
@@ -1183,6 +1213,132 @@ test("provider gates: a successful attempt after provider retries completes the 
     const engineering429 = evs.filter((e) => e.kind === "retry_scheduled" && String(e.reason).includes("attempt interrupted"));
     assert.equal(engineering429.length, 1, "a 429 AFTER real compute falls back to the normal interruption path");
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("runner SSE: completion via session.idle — final output intact, transcript fetched exactly once", async () => {
+  const longText = "x".repeat(5_000);
+  const counters: { subscribe?: number; context?: number } = {};
+  const client = stubEventClient(
+    [{ events: [
+      { type: "session.step.started", data: { sessionID: "ses_stub", assistantMessageID: "m1", agent: "build", model: { modelID: "m" } } },
+      { type: "session.tool.success", data: { sessionID: "ses_stub", id: "tool1", content: [{ name: "edit" }] } },
+      { type: "session.idle", data: { sessionID: "ses_stub" } },
+    ] }],
+    { context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [{ type: "user", text: "p" }, { type: "assistant", content: [{ type: "text", text: longText }] }] }; } },
+    counters,
+  );
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const progress: ProgressSignal[] = [];
+  const res = await runner.awaitCompletion(30_000, (s) => progress.push(s));
+  assert.equal(res.outcome, "completed");
+  assert.equal(res.output, longText, "final assistant output built once from the transcript, not from events");
+  assert.equal(counters.context, 1, "no repeated full-transcript polls in SSE mode");
+  assert.equal(counters.subscribe, 1, "no reconnect churn on a healthy stream");
+  assert.equal(progress.filter((s) => s.kind === "step").length, 1, "material step events become progress signals");
+  assert.equal(progress.filter((s) => s.kind === "tool").length, 1);
+  assert.equal(progress.some((s) => s.detail.includes("edit")), true, "tool name surfaced when present in payload");
+});
+
+test("runner SSE: session.execution.failed surfaces the provider error with its HTTP status", async () => {
+  const client = stubEventClient([
+    { events: [
+      { type: "session.execution.failed", data: { sessionID: "ses_stub", error: { message: "Provider request failed with HTTP 429: rate limited", status: 429 } } },
+    ] },
+  ]);
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const res = await runner.awaitCompletion(30_000);
+  assert.equal(res.outcome, "failed");
+  assert.ok(res.output.includes("provider/run error: Provider request failed with HTTP 429"), `output: ${res.output}`);
+});
+
+test("runner SSE: service retries are visible and deduplicated (status + retry.scheduled from ONE retry → one signal; no attempt duplication)", async () => {
+  const counters: { subscribe?: number } = {};
+  const client = stubEventClient([
+    { events: [
+      { type: "session.retry.scheduled", data: { sessionID: "ses_stub", attempt: 2, error: { message: "HTTP 429: too many", status: 429 } } },
+      { type: "session.status", data: { sessionID: "ses_stub", status: { type: "retry", attempt: 2, message: "HTTP 429: too many" } } },
+      { type: "session.idle", data: { sessionID: "ses_stub" } },
+    ] },
+  ], {}, counters);
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const res = await runner.awaitCompletion(30_000);
+  assert.equal(res.outcome, "completed");
+  const retries = res.signals.filter((s) => s.kind === "retry");
+  assert.equal(retries.length, 1, "both event forms describe the same service retry");
+  assert.ok(retries[0]!.detail.includes("attempt 2"), `detail: ${retries[0]!.detail}`);
+  assert.equal(res.signals.filter((s) => s.kind === "step" || s.kind === "tool").length, 0, "no synthetic progress invented from retries");
+});
+
+test("runner SSE: clean stream disconnect reconnects and still builds the result exactly once", async () => {
+  const counters: { subscribe?: number; context?: number } = {};
+  const client = stubEventClient([
+    { events: [{ type: "session.step.started", data: { sessionID: "ses_stub", assistantMessageID: "m1", agent: "build", model: { modelID: "m" } } }] },
+    { events: [{ type: "session.idle", data: { sessionID: "ses_stub" } }] },
+  ], { context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [{ type: "assistant", content: [{ type: "text", text: "done text" }] }] }; } }, counters);
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const res = await runner.awaitCompletion(30_000);
+  assert.equal(res.outcome, "completed");
+  assert.equal(res.output, "done text");
+  assert.equal(counters.subscribe, 2, "exactly one reconnect after the clean stream end");
+  assert.equal(res.signals.filter((s) => s.kind === "step").length, 1, "pre-disconnect progress is recorded, not replayed after reconnect");
+});
+
+test("runner fallback: unavailable SSE subscription falls back to polling (older SDKs, subscription errors)", async () => {
+  const counters: { subscribe?: number; context?: number } = {};
+  const longText = "fallback final output";
+  const client = stubClient({
+    active: async () => ({} as Record<string, unknown>),
+    context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [{ type: "assistant", content: [{ type: "text", text: longText }] }] }; },
+  }, counters);
+  (client as unknown as { event: unknown }).event = {
+    subscribe: () => { counters.subscribe = (counters.subscribe ?? 0) + 1; throw new Error("no SSE here"); },
+  };
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const progress: ProgressSignal[] = [];
+  const res = await runner.awaitCompletion(60_000, (s) => progress.push(s));
+  assert.equal(res.outcome, "completed");
+  assert.equal(res.output, longText, "fallback preserves the polling loop's exact result semantics");
+  assert.equal(progress.length, 1, "fallback still reports progress (message evolution)");
+  assert.equal(counters.subscribe, 1, "exactly one failed subscribe attempt, then polling");
+});
+
+test("runner fallback: reconnect budget exhausted → polling completes the run with the remaining deadline", async () => {
+  const counters: { subscribe?: number; active?: number; context?: number } = {};
+  const finalText = "completed after all streams died";
+  const client = stubEventClient(
+    [
+      { reset: true }, { reset: true }, { reset: true }, { reset: true }, { reset: true }, { reset: true },
+    ],
+    {
+      active: async () => { counters.active = (counters.active ?? 0) + 1; return (counters.active ?? 0) <= 6 ? { ses_stub: { type: "running" } } : ({} as Record<string, unknown>); },
+      context: async () => { counters.context = (counters.context ?? 0) + 1; return { data: [{ type: "assistant", content: [{ type: "text", text: finalText }] }] }; },
+    },
+    counters as Record<string, number>,
+  );
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const res = await runner.awaitCompletion(60_000);
+  assert.equal(res.outcome, "completed");
+  assert.equal(res.output, finalText);
+  assert.equal(counters.subscribe, 6, "1 subscription + 5 reconnect attempts before falling back");
+});
+
+test("runner SSE: usage captured from session.usage.updated without a redundant session.get", async () => {
+  const counters: { get?: number } = {};
+  const client = stubEventClient(
+    [{ events: [
+      { type: "session.usage.updated", data: { sessionID: "ses_stub", cost: 0.25, tokens: { input: 7, output: 9, reasoning: 2, cache: { read: 4, write: 1 } } } },
+      { type: "session.idle", data: { sessionID: "ses_stub" } },
+    ] }],
+    { get: async () => { counters.get = (counters.get ?? 0) + 1; return { tokens: { input: 999, output: 999, reasoning: 999, cache: { read: 999, write: 999 } }, cost: 9.99 }; } },
+    counters as Record<string, number>,
+  );
+  const runner = await OpenCodeRunner.start(client, { directory: ".", title: "t", agent: "build", promptText: "p" });
+  const res = await runner.awaitCompletion(30_000);
+  assert.equal(res.outcome, "completed");
+  const usage = await runner.usage();
+  assert.deepEqual(usage, { input: 7, output: 9, reasoning: 2, cacheRead: 4, cacheWrite: 1, cost: 0.25 },
+    "live usage event wins over a redundant per-attempt session.get");
+  assert.equal(counters.get ?? 0, 0, "no session.get round-trip when the event already carried usage");
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {
