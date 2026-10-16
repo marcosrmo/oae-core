@@ -14,6 +14,7 @@ import type { Plan } from "./planner.ts";
 import { makePlan, detectStack, defaultValidators } from "./planner.ts";
 import { Supervisor, type SweepAction } from "./supervisor.ts";
 import { runValidators, type ValidatorResult } from "./validators.ts";
+import { classifyProviderFailure } from "./events.ts";
 import * as git from "./git.ts";
 import { nowISO, truncate, sleep } from "./util.ts";
 
@@ -244,6 +245,14 @@ export class Orchestrator {
   private recoveryContext = new Map<string, string>();
   private baselineUncommitted: string[] = [];
 
+  /**
+   * Observability emit: an event write failure must never crash the run
+   * (dashboard availability is never mission-critical).
+   */
+  private emit(kind: string, data: Record<string, unknown>): void {
+    void this.store.event(kind, data).catch(() => undefined);
+  }
+
   private async dispatch(kind: "coder" | "reviewer", task: Task, refined?: string, reviewFormatReminder?: boolean): Promise<{ runner: AgentRunner; prompt: string }> {
     const cfg = this.opts.config;
     const stack = await detectStack(cfg.projectDir);
@@ -281,7 +290,8 @@ export class Orchestrator {
       sessionId: rev.runner.sessionId, agent: cfg.reviewerAgent, kind: "review",
       startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
     });
-    const revRes = await rev.runner.awaitCompletion(5 * 60_000);
+    const revRes = await rev.runner.awaitCompletion(5 * 60_000, (s) =>
+      this.emit("agent_progress", { taskId: task.id, attemptId: revAttempt.id, phase: "review", kind: s.kind, detail: s.detail }));
     const verdict = parseVerdict(revRes.output);
     const revUsage = await this.collectUsage(rev.runner);
     await this.store.finishAttempt(task.id, revAttempt.id, {
@@ -319,7 +329,10 @@ export class Orchestrator {
         sessionId: runner.sessionId, agent: cfg.coderAgent, kind: "code",
         startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
       });
-      const res = await runner.awaitCompletion(cfg.recovery.taskTimeoutMs - (Date.now() - taskStart), (s) => this.supervisor.noteSignal(task.id, s));
+      const res = await runner.awaitCompletion(cfg.recovery.taskTimeoutMs - (Date.now() - taskStart), (s) => {
+        this.supervisor.noteSignal(task.id, s);
+        this.emit("agent_progress", { taskId: task.id, attemptId: attempt.id, phase: "code", kind: s.kind, detail: s.detail });
+      });
       const usage = await this.collectUsage(runner);
       await this.store.finishAttempt(task.id, attempt.id, {
         outcome: res.outcome === "completed" ? "completed" : "interrupted",
@@ -328,6 +341,18 @@ export class Orchestrator {
         evidence: usage ? { tokens: JSON.stringify(usage) } : {},
       });
       if (res.outcome !== "completed") {
+        // structured observability: interruption vs provider/runtime failure
+        if (res.outcome === "interrupted") {
+          this.emit("session_interrupted", { taskId: task.id, attemptId: attempt.id, sessionId: runner.sessionId, detail: truncate(res.output || "interrupted before completion", 300) });
+        } else {
+          const f = classifyProviderFailure(res.output);
+          this.emit("provider_error", {
+            taskId: task.id, attemptId: attempt.id, sessionId: runner.sessionId,
+            runnerKind: f.kind, httpStatus: f.httpStatus,
+            message: truncate(f.message, 400),
+            tokensUnknown: usage === null,
+          });
+        }
         // supervisor recovery: sweep already produced refined instructions
         refined = this.recoveryContext.get(task.id) ??
           "The previous attempt was interrupted (timeout or recovery). Reduce scope and verify each step.";
@@ -337,12 +362,19 @@ export class Orchestrator {
           this.supervisor.unregister(task.id);
           return;
         }
-        await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        const waitMs = await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        this.emit("retry_scheduled", { taskId: task.id, attemptNo, reason: "attempt interrupted (deadline or recovery)", waitMs });
         continue;
       }
       if (!res.output.trim()) {
         // a "completed" session with no assistant text is a dispatch/provider
         // failure, not a code change — never send an empty attempt to review
+        const f = classifyProviderFailure("runner error: empty completed response (no assistant text; provider/dispatch failure is the likely cause)");
+        this.emit("provider_error", {
+          taskId: task.id, attemptId: attempt.id, sessionId: runner.sessionId,
+          runnerKind: "runner", httpStatus: undefined,
+          message: f.message, tokensUnknown: usage === null,
+        });
         await this.store.decide({
           by: "orchestrator", kind: "technical",
           text: `Task ${task.id} attempt ${attemptNo} produced an empty response`,
@@ -353,7 +385,8 @@ export class Orchestrator {
           this.supervisor.unregister(task.id);
           return;
         }
-        await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        const waitMs = await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        this.emit("retry_scheduled", { taskId: task.id, attemptNo, reason: "empty coder response", waitMs });
         continue;
       }
       if (/IMPEDIMENT:/i.test(res.output)) {
@@ -402,7 +435,8 @@ export class Orchestrator {
         ].join("\n");
         await this.store.decide({ by: "reviewer", kind: "technical", text: `Rejected task ${task.id} attempt ${attemptNo}`, rationale: refined });
         task = this.store.task(task.id);
-        await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        const waitMs = await backoffLite(cfg.recovery.backoffMs, attemptNo);
+        this.emit("retry_scheduled", { taskId: task.id, attemptNo, reason: "reviewer rejected (rework)", verdict: verdict?.verdict ?? "unparseable", waitMs });
         continue;
       }
 
@@ -442,8 +476,10 @@ function parseVerdict(output: string): ReviewVerdict | undefined {
   } catch { return undefined; }
 }
 
-async function backoffLite(baseMs: number, attempt: number): Promise<void> {
-  await sleep(Math.min(baseMs * 2 ** (attempt - 1), 30_000));
+async function backoffLite(baseMs: number, attempt: number): Promise<number> {
+  const wait = Math.min(baseMs * 2 ** (attempt - 1), 30_000);
+  await sleep(wait);
+  return wait;
 }
 
 export type { ValidatorResult };

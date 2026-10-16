@@ -158,9 +158,15 @@ export class Store {
     const t = this.task(taskId);
     const a = t.attempts.find((x) => x.id === attemptId);
     if (!a) throw new Error(`Unknown attempt ${attemptId} on ${taskId}`);
+    const startedAt = a.startedAt;
     Object.assign(a, patch, { endedAt: nowISO() });
     t.updatedAt = nowISO();
     await this.persist();
+    const elapsedMs = Math.max(0, Date.parse(a.endedAt!) - Date.parse(startedAt));
+    await this.event("attempt_finished", {
+      taskId, attemptId, kind: a.kind, outcome: a.outcome,
+      sessionId: a.sessionId, elapsedMs,
+    });
   }
 
   async decide(d: Omit<Decision, "id" | "at">): Promise<Decision> {

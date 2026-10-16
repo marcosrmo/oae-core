@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -18,7 +18,7 @@ import { renderReport } from "../src/report.ts";
 import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock } from "../src/runlock.ts";
-import { OpenCodeRunner, type Client, type SessionUsage } from "../src/opencode.ts";
+import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type AgentRunResult, type ProgressSignal } from "../src/opencode.ts";
 
 /** Minimal stub of the OpenCode service client for OpenCodeRunner tests. */
 function stubClient(over: Record<string, unknown> = {}, counters: { interrupt?: number; context?: number } = {}): Client {
@@ -76,6 +76,35 @@ function plan1(dir: string, task: Partial<Plan["tasks"][number]> = {}): Plan {
 }
 
 const FACTORY_OK_CODER = () => new FakeRunner("s-code", { type: "complete", output: "RESULT:\nfiles: src/hello.ts\ncommands: none" });
+
+/** A scripted runner: pops one prepared result per awaitCompletion; emits a
+ * progress signal like a real session would. Also records requested usage. */
+function scriptedRunner(script: { result: { outcome: AgentRunResult["outcome"]; output?: string }; usage?: SessionUsage | null }[]): AgentRunner {
+  let i = 0;
+  let lastUsage: SessionUsage | null = null;
+  const r: AgentRunner = {
+    sessionId: "s-script-" + String(scriptedRunnerSeq++),
+    prompt: async () => {},
+    awaitCompletion: async (_t, onProgress) => {
+      const step = script[Math.min(i, script.length - 1)]!;
+      i++;
+      lastUsage = "usage" in step ? step.usage ?? null : null;
+      onProgress?.({ at: new Date().toISOString(), kind: "message", detail: "scripted signal" });
+      return { outcome: step.result.outcome, output: step.result.output ?? "", signals: [] };
+    },
+    interrupt: async () => {},
+    transcriptTail: async () => "",
+    usage: async () => lastUsage,
+  };
+  return r;
+}
+let scriptedRunnerSeq = 0;
+
+/** Parse `<project>/.oae/events.jsonl` into objects (test helper). */
+async function readEvents(dir: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(join(dir, ".oae", "events.jsonl"), "utf8");
+  return raw.trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
 
 test("task lifecycle: dispatch → review → validators → commit → done", async () => {
   const dir = await makeProject();
@@ -757,6 +786,74 @@ test("maxReviewReasks=0 preserves the legacy behavior (unparseable review goes s
     assert.equal(state.status, "done");
     assert.equal(state.tasks[0].attempts.filter((a) => a.kind === "review").length, 2, "no re-ask when disabled");
     assert.ok(!state.decisions.some((d) => d.text.includes("re-asking the reviewer")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("instrumentation: agents' lifecycle events are typed, classified and complete (observability)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxAttempts = 6;
+    const store = await Store.create(dir, "run-instr", "lifecycle instrumented");
+    // coder: interrupted → HTTP 429 → empty (zero confirmed tokens) → ok;
+    // reviewer: reject → coder ok → approve
+    const coderScript = [
+      { result: { outcome: "interrupted" as const, output: "" }, usage: null },
+      { result: { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 429: {\"status\":429}" }, usage: null },
+      { result: { outcome: "completed" as const, output: "" }, usage: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+      { result: { outcome: "completed" as const, output: "RESULT:\nfiles: none\nIMPEDIMENT: none" }, usage: { input: 10, output: 5, reasoning: 2, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+      { result: { outcome: "completed" as const, output: "RESULT:\nfiles: none\nIMPEDIMENT: none" }, usage: { input: 11, output: 6, reasoning: 2, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+    ];
+    let coderIdx = 0;
+    const reviewerScript = [
+      { result: { outcome: "completed" as const, output: REVIEWER_REJECT("minor issue") }, usage: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+      { result: { outcome: "completed" as const, output: REVIEWER_OK }, usage: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+    ];
+    let reviewerIdx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => {
+        const next = kind === "coder" ? coderScript[Math.min(coderIdx++, coderScript.length - 1)]! : { result: reviewerScript[Math.min(reviewerIdx++, reviewerScript.length - 1)]!.result };
+        return scriptedRunner([{ result: next.result as { outcome: AgentRunResult["outcome"]; output?: string }, usage: "usage" in next ? next.usage : undefined }]);
+      },
+    });
+    const { state } = await orch.run("lifecycle instrumented");
+    assert.equal(state.status, "done");
+
+    const evs = await readEvents(dir);
+    const kinds = (k: string) => evs.filter((e) => e.kind === k);
+    // attempt_finished: 7 attempts (5 code + 2 review), each with elapsedMs
+    const finished = kinds("attempt_finished");
+    assert.equal(finished.length, 7);
+    assert.ok(finished.every((e) => typeof e.elapsedMs === "number" && (e.elapsedMs as number) >= 0));
+    // session interrupt recorded
+    const interrupted = kinds("session_interrupted");
+    assert.equal(interrupted.length, 1);
+    assert.equal(interrupted[0]!.taskId, "task-1");
+    // provider errors: HTTP 429 (tokens unknown) + empty-output dispatch failure
+    const prov = kinds("provider_error");
+    assert.equal(prov.length, 2);
+    assert.equal(prov[0]!.httpStatus, 429);
+    assert.equal(prov[0]!.tokensUnknown, true);
+    assert.equal(prov[0]!.runnerKind, "provider");
+    assert.equal(prov[1]!.runnerKind, "runner");
+    assert.equal(prov[1]!.tokensUnknown, false, "zero confirmed tokens is not 'unknown'");
+    // retries scheduled with deterministic reasons and wait
+    const retries = kinds("retry_scheduled");
+    const reasons = retries.map((r) => r.reason);
+    assert.deepEqual(reasons, [
+      "attempt interrupted (deadline or recovery)",
+      "attempt interrupted (deadline or recovery)",
+      "empty coder response",
+      "reviewer rejected (rework)",
+    ]);
+    assert.ok(retries.every((r) => typeof r.waitMs === "number" && (r.waitMs as number) >= 0));
+    // progress from inside the agent loop, tagged with phase/attempt
+    const progress = kinds("agent_progress");
+    assert.ok(progress.length >= 5, "progress signals recorded");
+    assert.ok(progress.some((p) => p.phase === "code" && p.attemptId === 1));
+    assert.ok(progress.some((p) => p.phase === "review"));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
