@@ -39,6 +39,21 @@ contains credentials.
   checkout branch is never modified. No `git reset --hard`, no `git checkout -- .`,
   no destructive git operations anywhere in the codebase.
 
+## Anti-recursion (D13)
+
+An OAE run dispatches OpenCode agent sessions; those sessions must never launch
+further OAE runs. Four layers:
+
+1. The `oae` OpenCode skill (this package, `skills/oae/SKILL.md`) opens with the
+   rule: sessions dispatched *by* an OAE run never invoke the OAE CLI.
+2. Coder, reviewer and planner prompts carry an explicit no-nested-run rule.
+3. `run` and `plan` hold `.oae/run.lock` (pid + runId) for the duration of the
+   run. A second concurrent run in the same directory is refused with exit
+   code 3; locks whose pid is no longer alive are reclaimed automatically;
+   `--force` overrides a live lock as an explicit operator action.
+4. Every run is bounded regardless: maxAttempts (3), maxRecoveryCycles (2),
+   taskTimeoutMs (30 min), runTimeoutMs (2 h), commandTimeoutMs (5 min).
+
 ## Publication
 
 `oae publish` is **authorization-gated**: it is only invoked on explicit user

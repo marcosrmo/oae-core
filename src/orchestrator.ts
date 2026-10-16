@@ -52,6 +52,8 @@ const CODER_PROMPT = (task: Task, stack: string, validators: string[], refined?:
   "5. Never declare completion without proof (command output or file evidence).",
   "6. NEVER modify or create files inside '.oae/' or '.opencode/' — those belong to the orchestrator.",
   "7. Do not create config files (package.json, tsconfig, etc.) unless the task explicitly requires them.",
+  "8. NEVER invoke the OAE CLI (`oae`, `node src/index.ts`, `npm run start`) and never start another",
+  "   autonomous engineering run — you are already inside one; nested runs are refused and waste resources.",
 ].join("\n");
 
 const REVIEWER_PROMPT = (task: Task, diff: string) => [
@@ -73,6 +75,7 @@ const REVIEWER_PROMPT = (task: Task, diff: string) => [
   '{"verdict":"approve"|"reject","findings":[{"severity":"critical"|"major"|"minor","text":string}],"summary":string}',
   "Reject when any acceptance criterion is unmet or a critical/major finding exists.",
   "Evidence every finding with a file/line or command result.",
+  "You are inside an autonomous engineering run: NEVER invoke the OAE CLI or start another run — judge only.",
 ].join("\n");
 
 interface ReviewVerdict {

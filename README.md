@@ -43,7 +43,17 @@ node <path-to-oae>/src/index.ts publish --dir .        # requires explicit autho
 ```
 
 Useful flags: `--model providerID/modelID` (default: service default model),
-`--dry-run`, `--concurrency N` (parallel tasks, default 1).
+`--dry-run`, `--concurrency N` (parallel tasks, default 1), `--force`
+(override a live `.oae/run.lock`).
+
+## Running from inside OpenCode
+
+`oae init` also installs a project-local OpenCode skill — `oae` (from
+[`skills/oae/SKILL.md`](skills/oae/SKILL.md)) — into the target project's
+`.opencode/skills/`. Any OpenCode agent working in that project can then
+discover the skill and follow it to launch OAE missions and track their
+results, with anti-recursion rules (never invoke OAE from inside an
+OAE-dispatched session; one run per directory via `.oae/run.lock`).
 
 ## Project layout
 
@@ -62,8 +72,10 @@ src/
   config.ts        defaults + project overrides (.oae/config.json)
   setup.ts         installs project-local skills + reviewer agent
   util.ts          runCommand (hard timeouts), atomic JSON writes, JSONL append
+  runlock.ts        one-run-per-directory lock (anti-recursion backstop)
 skills/            agent procedures (autonomous-engineering, independent-review,
-                   blocked-task-recovery)
+                   blocked-task-recovery) + the `oae` skill for launching and
+                   tracking missions from inside OpenCode
 test/              unit tests (fake agents) + real integration test
 docs/              architecture, recovery, security, decisions, test report
 ```
@@ -74,6 +86,8 @@ docs/              architecture, recovery, security, decisions, test report
 - **Branch isolation** — agents work on `oae/auto-<id>`; the user's branch is untouched.
 - **Read-only reviewer** — the reviewer agent has `edit`/`write` denied at the agent level.
 - **Hard timeouts** — every validator command, agent session and run is time-bounded.
+- **Anti-recursion** — OAE-dispatched sessions never launch OAE; one run per
+  directory is enforced by `.oae/run.lock` (see docs/SECURITY.md).
 - **No secrets in artifacts** — service password, provider keys and GitHub credentials
   are handled by OpenCode/credential store, never logged or persisted.
 

@@ -15,6 +15,8 @@ Status: **v0.1.0 — core system complete and tested** (13/13 unit + 1/1 integra
 - [x] Evidence-based final report
 - [x] Skills package (autonomous-engineering, independent-review, blocked-task-recovery)
 - [x] 13 deterministic unit tests + 1 real integration test
+- [x] OpenCode→OAE direction: `oae` skill (launch/track missions from inside
+      OpenCode) + anti-recursion guards and run lock (D12/D13; unit tested)
 
 ## Next (v0.2)
 - [ ] Run resumption: `oae resume --dir .` continuing an interrupted run from `.oae/state.json`

@@ -7,6 +7,7 @@ import { strict as assert } from "node:assert/strict";
 import { mkdtemp, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { Store, type RunState } from "../src/store.ts";
 import { Orchestrator, type RunOptions } from "../src/orchestrator.ts";
 import { loadConfig, type OaeConfig } from "../src/config.ts";
@@ -15,6 +16,7 @@ import { FakeRunner, REVIEWER_OK, REVIEWER_REJECT } from "./fake.ts";
 import { renderReport } from "../src/report.ts";
 import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
+import { acquireRunLock, releaseRunLock } from "../src/runlock.ts";
 
 async function makeProject(): Promise<string> {
   return mkdtemp(join(tmpdir(), "oae-unit-"));
@@ -392,6 +394,67 @@ test("final report renders real evidence", async () => {
     assert.ok(report.includes("**done**"));
     assert.ok(report.includes("selftest: exit=0"));
     assert.ok(report.includes("[technical]"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("run lock: acquire, refuse concurrent holder, release", async () => {
+  const dir = await makeProject();
+  try {
+    const a = await acquireRunLock(dir, "run-a");
+    assert.equal(a.ok, true);
+    const raw = JSON.parse(await readFile(join(dir, ".oae", "run.lock"), "utf8")) as { pid: number; runId: string };
+    assert.equal(raw.pid, process.pid);
+    assert.equal(raw.runId, "run-a");
+    // same-process re-acquire (e.g. retry after internal error) is allowed
+    const a2 = await acquireRunLock(dir, "run-a2");
+    assert.equal(a2.ok, true);
+    // release only removes our own lock
+    await releaseRunLock(dir, "someone-else");
+    assert.ok(await stat(join(dir, ".oae", "run.lock")));
+    await releaseRunLock(dir, "run-a2");
+    await assert.rejects(stat(join(dir, ".oae", "run.lock")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("run lock: live foreign pid is refused; --force overrides; stale pid reclaimed", async () => {
+  const dir = await makeProject();
+  try {
+    // a real live process holds the lock
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+    await new Promise((r) => holder.on("spawn", r));
+    await acquireRunLock(dir, "run-holder");
+    await writeFile(join(dir, ".oae", "run.lock"), JSON.stringify({ pid: holder.pid, runId: "run-foreign", startedAt: new Date().toISOString() }), "utf8");
+    const refused = await acquireRunLock(dir, "run-nested");
+    assert.equal(refused.ok, false);
+    assert.ok((refused.reason ?? "").includes("already active"));
+    const forced = await acquireRunLock(dir, "run-forced", { force: true });
+    assert.equal(forced.ok, true);
+    await releaseRunLock(dir, "run-forced");
+    // stale lock (pid exited) is reclaimed automatically
+    const dead = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    await new Promise((r) => dead.on("exit", r));
+    await writeFile(join(dir, ".oae", "run.lock"), JSON.stringify({ pid: dead.pid, runId: "run-stale", startedAt: new Date().toISOString() }), "utf8");
+    const reclaimed = await acquireRunLock(dir, "run-new");
+    assert.equal(reclaimed.ok, true);
+    holder.kill();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("anti-recursion: dispatched prompts forbid launching nested runs", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-antirecursion", "prompt guards");
+    const coder = new FakeRunner("s-code-g", { type: "complete", output: "RESULT:\nfiles: none" });
+    const reviewer = new FakeRunner("s-rev-g", { type: "complete", output: REVIEWER_OK });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? coder : reviewer),
+    });
+    await orch.run("prompt guards");
+    assert.ok(coder.prompts[0].includes("NEVER invoke the OAE CLI"), "coder prompt must forbid nested runs");
+    assert.ok(reviewer.prompts[0].includes("NEVER invoke the OAE CLI"), "reviewer prompt must forbid nested runs");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

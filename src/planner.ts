@@ -86,6 +86,7 @@ async function planWithModel(
       "Respond with ONLY a JSON object (no markdown fences) shaped:",
       '{"summary":string,"tasks":[{"id":string,"title":string,"instructions":string,"dependsOn":string[],"acceptance":string[]}],"decisions":[{"kind":"technical"|"business-hypothesis"|"needs-approval","text":string,"rationale":string}]}',
       "Rules: max 5 tasks; each task implementable in one session; instructions must reference concrete files; acceptance criteria must be checkable commands or verifiable conditions; never invent financial/legal/commercial rules (mark such hypotheses kind='business-hypothesis').",
+      "This is the planning step of one autonomous run: do not start other runs and do not invoke the OAE CLI; respond with the JSON only.",
     ].join("\n"),
   }));
   const result = await runner.awaitCompletion(5 * 60_000);

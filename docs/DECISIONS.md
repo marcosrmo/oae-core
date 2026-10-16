@@ -70,3 +70,45 @@ supersede older ones; superseded entries are kept for context.
 ## D11 — Publication is authorization-gated
 - **Decision:** `oae publish` exists but is never invoked autonomously; repo
   creation/push requires explicit user approval. Repos private by default.
+
+## D12 — OpenCode↔OAE integration: skill + existing CLI (no MCP)
+- **Decision:** the mechanism by which an OpenCode agent operates OAE is the
+  **existing CLI invoked through OpenCode's shell tool**, made *discoverable*
+  by a project-local OpenCode skill (`oae`, shipped in `skills/oae/SKILL.md`
+  and installed into target projects by `oae init`). The skill documents how to
+  launch a mission (`oae run`), track it (`oae status`/`report`,
+  `.oae/state.json`, `.oae/events.jsonl`) and the anti-recursion rules.
+- **Alternatives rejected:**
+  - *MCP server exposing `oae_run`/`oae_status`/`oae_report` tools* — no
+    concrete benefit: runs are long-lived (minutes to hours) and file-state
+    based, so the CLI already provides async start + polling; MCP would only
+    wrap the same child process while adding a server, config surface and
+    timeout semantics (`mcp.timeout`) that fit poorly with hour-long runs.
+  - *Plugin (custom tool)* — same wrapping cost, plus the plugin API is the
+    most volatile surface across versions.
+  - *Custom command (`.opencode/command`)* — user-invokable TUI UX, not the
+    agent path; can be added later without changing this decision.
+- **Rationale:** uses only native, stable v2 mechanisms (skills surface via
+  `GET /api/skill` and load via the `skill` tool — verified in
+  docs/ENVIRONMENT_AUDIT.md); zero new processes, zero global config changes;
+  the agent keeps full inspection powers (files, exit codes, git) over runs.
+- **Direction matters:** the pre-existing `@opencode/client` integration (D1)
+  is OAE *driving* the OpenCode service. D12 is the opposite direction —
+  OpenCode *operating* OAE. Both are required for self-hosting.
+
+## D13 — Anti-recursion: layered, deterministic guards
+- **Decision:** an OAE run must never (transitively) launch OAE runs. Layers:
+  1. *Skill rule* — `oae` skill's first section forbids invoking OAE from
+     inside an OAE-dispatched session.
+  2. *Prompt guards* — coder/reviewer/planner prompts explicitly forbid
+     launching nested runs (test: "anti-recursion: dispatched prompts ...").
+  3. *Run lock* — `run`/`plan` hold `.oae/run.lock` (pid + runId); a second
+     concurrent run in the same directory is refused (exit 3), stale locks
+     (dead pid) are reclaimed, `--force` is the explicit operator override
+     (tests: "run lock: ...").
+  4. *Pre-existing hard bounds* — maxAttempts, maxRecoveryCycles, task and run
+     timeouts bound every run regardless.
+- **Rationale:** prompt rules alone are probabilistic; the lock makes the
+  same-directory case (the realistic recursion vector: a coder session
+  shelling out in its own project) deterministically refused while the outer
+  run is alive. Cross-directory recursion is bounded by layer 4.
