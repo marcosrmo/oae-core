@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat, readdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -19,6 +19,9 @@ import { inspectGit } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock } from "../src/runlock.ts";
 import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type AgentRunResult, type ProgressSignal } from "../src/opencode.ts";
+import { loadRunView, type RunView } from "../src/viewmodel.ts";
+import { renderSummary, renderResultLine } from "../src/dashboard.ts";
+import { listRunHistory } from "../src/history.ts";
 
 /** Minimal stub of the OpenCode service client for OpenCodeRunner tests. */
 function stubClient(over: Record<string, unknown> = {}, counters: { interrupt?: number; context?: number } = {}): Client {
@@ -104,6 +107,30 @@ let scriptedRunnerSeq = 0;
 async function readEvents(dir: string): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(join(dir, ".oae", "events.jsonl"), "utf8");
   return raw.trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+/** Write a synthetic `.oae/` with a given state + events (viewmodel fixtures). */
+async function writeOae(dir: string, state: RunState, events: Array<Record<string, unknown>>): Promise<void> {
+  await mkdir(join(dir, ".oae"), { recursive: true });
+  await writeFile(join(dir, ".oae", "state.json"), JSON.stringify(state, null, 2), "utf8");
+  await writeFile(join(dir, ".oae", "events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+}
+
+const DEMO_REQUEST = "demo request";
+
+function demoState(over: Partial<RunState> = {}): RunState {
+  return {
+    id: "run-demo",
+    request: DEMO_REQUEST,
+    projectDir: "_TESTDIR_",
+    startedAt: "2026-10-16T10:00:00.000Z",
+    status: "running",
+    git: { branch: "oae/auto-run-demo" },
+    tasks: [],
+    decisions: [],
+    validatorResults: {},
+    ...over,
+  };
 }
 
 test("task lifecycle: dispatch → review → validators → commit → done", async () => {
@@ -855,6 +882,211 @@ test("instrumentation: agents' lifecycle events are typed, classified and comple
     assert.ok(progress.some((p) => p.phase === "code" && p.attemptId === 1));
     assert.ok(progress.some((p) => p.phase === "review"));
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("viewmodel: phases, stall detection, token provenance (confirmed zero vs unknown)", async () => {
+  const dir = await makeProject();
+  try {
+    const t = (at: string) => (at.startsWith("20") ? at : `2026-10-16T10:${at}Z`);
+    const state = demoState({
+      tasks: [{
+        id: "task-1", title: "demo", instructions: "", dependsOn: [], acceptance: [], status: "in_progress",
+        recoveryCycles: 0, createdAt: t("00:10"), updatedAt: t("00:30"),
+        attempts: [
+          { id: 1, sessionId: "s1", agent: "build", kind: "code", startedAt: t("00:10"), outcome: "running", summary: "", filesChanged: [], evidence: {} },
+          { id: 2, sessionId: "s2", agent: "build", kind: "code", startedAt: t("00:05"), endedAt: t("00:09"), outcome: "completed", summary: "", filesChanged: [], evidence: { tokens: JSON.stringify({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }) } },
+        ],
+      }],
+    });
+    const events = [
+      { at: t("00:00"), kind: "run_started", request: DEMO_REQUEST },
+      { at: t("00:05"), kind: "plan_ready", tasks: 1, summary: "single task" },
+      { at: t("00:10"), kind: "attempt_added", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "running" },
+      { at: t("00:30"), kind: "agent_progress", taskId: "task-1", attemptId: 1, phase: "code", signalKind: "tool", detail: "messages=4 lastType=assistant tools=edit" },
+    ];
+    await writeOae(join(dir), state, events);
+
+    // 40s after the last confirmed activity → actively executing
+    const v1 = await loadRunView(dir, { nowMs: Date.parse(t("00:40")), stallThresholdMs: 7 * 60_000 })!;
+    assert.ok(v1);
+    assert.equal(v1.phase, "executando");
+    assert.equal(v1.tokens.attemptsWithTokens, 1, "attempt without evidence.tokens is NOT counted as having tokens");
+    assert.equal(v1.tokens.totals.unknown, true, "partial telemetry stays unknown, never faked");
+    assert.equal(v1.lastConfirmedActivity?.label.includes("tools=edit"), true);
+    assert.equal(v1.stallMs, undefined, "no stall within the threshold");
+
+    // 8 minutes without confirmable activity → explicit no-progress phase
+    const v2 = await loadRunView(dir, { nowMs: Date.parse(t("08:20")), stallThresholdMs: 7 * 60_000 });
+    assert.ok(v2);
+    assert.equal(v2.phase, "sem progresso detectável");
+    assert.ok((v2.stallMs ?? 0) > 7 * 60_000);
+
+    // a terminal status is respected regardless of events
+    await writeOae(join(dir), { ...state, status: "failed", endedAt: t("05:00") }, events);
+    const v3 = await loadRunView(dir, { nowMs: Date.parse(t("08:20")) });
+    assert.ok(v3);
+    assert.equal(v3.phase, "falhou");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("viewmodel: retry/preparation phase and provider-error alerts surfaced from events", async () => {
+  const dir = await makeProject();
+  try {
+    const t = (s: string) => `2026-10-16T10:0${s}`;
+    const state = demoState({
+      tasks: [{
+        id: "task-1", title: "demo", instructions: "", dependsOn: [], acceptance: [], status: "in_progress",
+        recoveryCycles: 0, createdAt: t("00:10"), updatedAt: t("00:40"),
+        attempts: [
+          { id: 1, sessionId: "s1", agent: "build", kind: "code", startedAt: t("00:10"), endedAt: t("00:30"), outcome: "interrupted", summary: "", filesChanged: [], evidence: {} },
+        ],
+      }],
+      validatorResults: { selftest: [{ name: "selftest", code: 1, timedOut: false, at: t("00:35") }] },
+    });
+    const events = [
+      { at: t("00:00"), kind: "run_started", request: DEMO_REQUEST },
+      { at: t("00:01"), kind: "plan_ready", tasks: 1 },
+      { at: t("00:10"), kind: "attempt_added", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "running" },
+      { at: t("00:30"), kind: "attempt_finished", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "interrupted", elapsedMs: 20000 },
+      { at: t("00:31"), kind: "session_interrupted", taskId: "task-1", attemptId: 1 },
+      { at: t("00:36"), kind: "validator", name: "selftest", code: 1, timedOut: false },
+      { at: t("00:37"), kind: "provider_error", taskId: "task-1", attemptId: 1, runnerKind: "provider", httpStatus: 429, message: "Provider request failed with HTTP 429: too many", tokensUnknown: true },
+      { at: t("00:38"), kind: "retry_scheduled", taskId: "task-1", attemptNo: 1, reason: "attempt interrupted (deadline or recovery)", waitMs: 5000 },
+    ];
+    await writeOae(join(dir), state, events);
+    const v = await loadRunView(join(dir), { nowMs: Date.parse(t("00:42")), stallThresholdMs: 7 * 60_000 });
+    assert.ok(v);
+    assert.equal(v.phase, "em nova tentativa", "rework markers after the last attempt_added = preparing a retry");
+    assert.equal(v.providerErrors.length, 1);
+    assert.equal(v.providerErrors[0]!.httpStatus, 429);
+    assert.equal(v.retries.length, 1);
+    const provLine = v.timeline.find((x) => x.type === "provider_error");
+    assert.equal(provLine?.level, "error");
+    assert.ok(provLine!.label.includes("HTTP 429"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("dashboard render: deterministic, CI-safe (no ANSI unless TTY), alerts and result line from real outcomes", async () => {
+  const dir = await makeProject();
+  try {
+    const state = demoState({
+      status: "failed", endedAt: "2026-10-16T10:05:30.000Z", summary: "0/1 tasks completed; validators: selftest=1",
+      tasks: [{
+        id: "task-1", title: "demo task", instructions: "", dependsOn: [], acceptance: [], status: "blocked", blockedReason: "provider unavailable after 3 provider retries",
+        recoveryCycles: 0, createdAt: "2026-10-16T10:00:10Z", updatedAt: "2026-10-16T10:05:20Z",
+        attempts: [
+          { id: 1, sessionId: "s1", agent: "build", kind: "code", startedAt: "2026-10-16T10:00:10Z", endedAt: "2026-10-16T10:01:40Z", outcome: "interrupted", summary: "", filesChanged: [], evidence: {} },
+          { id: 2, sessionId: "s2", agent: "build", kind: "provider_retry", startedAt: "2026-10-16T10:02:10Z", endedAt: "2026-10-16T10:02:40Z", outcome: "interrupted", summary: "", filesChanged: [], evidence: { tokens: JSON.stringify({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }) } },
+        ],
+      }],
+      validatorResults: { selftest: [{ name: "selftest", code: 1, timedOut: false, at: "2026-10-16T10:01:45Z" }] },
+    });
+    const label = (s: string) => `2026-10-16T10:0${s}`;
+    const events = [
+      { at: label("00:00"), kind: "run_started", request: DEMO_REQUEST },
+      { at: label("00:01"), kind: "plan_ready", tasks: 1 },
+      { at: label("00:10"), kind: "attempt_added", taskId: "task-1", attemptId: 1, attemptKind: "code", outcome: "running" },
+      { at: label("00:31"), kind: "provider_error", taskId: "task-1", attemptId: 1, runnerKind: "provider", httpStatus: 429, message: "provider/run error: Provider request failed with HTTP 429", tokensUnknown: true },
+      { at: label("00:32"), kind: "retry_scheduled", taskId: "task-1", attemptNo: 1, reason: "provider rate limit", waitMs: 30000 },
+      { at: label("03:20"), kind: "run_finished", status: "failed", summary: "0/1 tasks completed" },
+    ];
+    await writeOae(join(dir), state, events);
+    const view = await loadRunView(join(dir), { nowMs: Date.parse("2026-10-16T10:06:00Z") });
+    assert.ok(view);
+    const text = renderSummary(view, { width: 80 });
+    assert.ok(!text.includes("\x1b["), "no ANSI escapes in non-TTY mode");
+    assert.ok(text.includes("OAE run-demo"), "run header with id");
+    assert.ok(text.includes("falhou") || text.includes("bloqueada"), "phase/status visible");
+    assert.ok(text.includes("HTTP 429"), "provider alert surfaced");
+    assert.ok(text.includes("provider unavailable after 3 provider retries"), "blocked reason surfaced");
+    assert.ok(text.includes("retry scheduled: provider rate limit"), "retry scheduling surfaced from events");
+    assert.ok(text.includes("unknown (no usage recorded)") || text.includes("total:"), "token metrics section present");
+    assert.ok(text.includes("0/1 tasks completed"), "final summary mirrors the real run outcome");
+    const result = renderResultLine(view, { colors: false });
+    assert.ok(result.includes("FALHOU/BLOQUEADA"), "result line matches the failed run");
+    assert.ok(result.includes("0 concluídas"), "task rollup from real statuses, never invented");
+    // duration formatting from real timestamps
+    assert.ok(text.includes("5m30s") || text.includes("330s"), "duration formatted");
+    // detail mode includes the full timeline including the last events
+    const detailed = renderSummary(view, { width: 120, detail: true });
+    assert.ok(detailed.includes("run_finished") || detailed.includes("run finished"), "timeline present");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("history: previous run archived before overwrite, readable, with provider counts", async () => {
+  const dir = await makeProject();
+  try {
+    const oldState = demoState({
+      id: "run-old", status: "failed", endedAt: "2026-10-16T10:05:30.000Z",
+      tasks: [{ id: "task-1", title: "demo", instructions: "", dependsOn: [], acceptance: [], status: "blocked", recoveryCycles: 0, createdAt: "2026-10-16T10:00:10Z", updatedAt: "2026-10-16T10:05:20Z", attempts: [] }],
+    });
+    const t = (s: string) => `2026-10-16T10:${s}Z`;
+    const events = [
+      { at: t("00:00"), kind: "run_started", request: DEMO_REQUEST },
+      { at: t("01:00"), kind: "provider_error", httpStatus: 429, message: "x" },
+      { at: t("02:00"), kind: "provider_error", httpStatus: 429, message: "y" },
+      { at: t("03:00"), kind: "provider_error", httpStatus: 401, message: "z" },
+      { at: t("05:30"), kind: "run_finished", status: "failed" },
+    ];
+    await writeOae(join(dir), oldState, events);
+
+    // creating a NEW run must archive the old one, not lose it
+    const store = await Store.create(dir, "run-new", "second run");
+    assert.equal(store.state.id, "run-new");
+    const histDir = join(dir, ".oae", "history", "run-old");
+    const archived = JSON.parse(await readFile(join(histDir, "state.json"), "utf8")) as RunState;
+    assert.equal(archived.id, "run-old");
+    assert.equal((await readFile(join(histDir, "events.jsonl"), "utf8")).includes("run_started"), true);
+
+    const runs = await listRunHistory(dir);
+    assert.equal(runs.length, 2);
+    const old = runs.find((r) => r.id === "run-old")!;
+    assert.equal(old.source, "archived");
+    assert.equal(old.provider?.http429, 2);
+    assert.equal(old.provider?.http401, 1);
+    assert.equal(old.durationMs, 330 * 1000);
+    assert.equal(runs.find((r) => r.id === "run-new")!.source, "current");
+
+    // archiving is idempotent and does not self-archive the same runId
+    const again = await Store.create(dir, "run-new", "second run resume");
+    assert.equal(again.state.id, "run-new");
+    assert.equal(await listRunHistory(dir).then((rs) => rs.length), 2);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("CLI: `oae dashboard` renders a snapshot from .oae files; `oae status` behavior unchanged", async () => {
+  const dir = await makeProject();
+  const empty = await makeProject();
+  try {
+    const now = new Date().toISOString();
+    const state = demoState({ status: "done", endedAt: now, summary: "1/1 tasks completed; validators: selftest=0" });
+    await writeOae(dir, state, [
+      { at: now, kind: "run_started", request: DEMO_REQUEST },
+      { at: now, kind: "run_finished", status: "done" },
+    ]);
+    const nodeBin = process.execPath;
+    const run = (args: string[]) => new Promise<{ code: number | null; out: string }>((res) => {
+      const child = spawn(nodeBin, [join("src", "index.ts"), ...args], { cwd: process.cwd(), env: { ...process.env } });
+      let out = "";
+      child.stdout?.on("data", (d) => (out += d));
+      child.stderr?.on("data", (d) => (out += d));
+      child.on("close", (code) => res({ code, out }));
+      child.on("error", () => res({ code: -1, out }));
+    });
+    const dash = await run(["dashboard", "--dir", dir]);
+    assert.equal(dash.code, 0);
+    assert.ok(dash.out.includes("OAE run-demo"), `dashboard snapshot shows the run id (${dash.out.slice(0, 200)})`);
+    assert.ok(dash.out.includes("CONCLUÍDA"));
+    // non-follow snapshot must terminate (no infinite loop in CI)
+    assert.ok(!dash.out.includes("\x1b["), "CI-safe output (no ANSI)");
+    // status command behavior must stay stable for scripts
+    const st = await run(["status", "--dir", dir]);
+    assert.equal(st.code, 0);
+    assert.ok(st.out.split(/\r?\n/).some((l) => l.startsWith("task-1") || l.startsWith("run:")));
+    const stEmpty = await run(["status", "--dir", empty]);
+    assert.equal(stEmpty.code, 1);
+    assert.equal(stEmpty.out.trim(), "no runs found");
+  } finally { await rm(dir, { recursive: true, force: true }); await rm(empty, { recursive: true, force: true }); }
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {

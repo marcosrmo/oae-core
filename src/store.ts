@@ -8,6 +8,7 @@
  */
 import { join } from "node:path";
 import { appendJsonl, nowISO, readJson, writeJsonAtomic } from "./util.ts";
+import { archivePreviousRun } from "./history.ts";
 
 export type TaskStatus =
   | "pending" | "in_progress" | "awaiting_review" | "rework"
@@ -17,7 +18,7 @@ export interface Attempt {
   id: number;
   sessionId: string;
   agent: string;
-  kind: "code" | "review" | "recovery" | "diagnosis";
+  kind: "code" | "review" | "recovery" | "diagnosis" | "provider_retry";
   startedAt: string;
   endedAt?: string;
   outcome: "running" | "completed" | "failed" | "interrupted" | "rejected" | "approved";
@@ -78,7 +79,10 @@ export class Store {
   static async create(projectDir: string, runId: string, request: string): Promise<Store> {
     const s = new Store(projectDir, runId);
     const existing = await Store.load(projectDir, runId);
-    if (existing) return existing;
+    if (existing && existing.state.id === runId) return existing; // resume the same run
+    // a NEW run replaces the previous one — archive it first (additive
+    // preservation; `oae history` keeps it readable after the overwrite)
+    await archivePreviousRun(projectDir, runId);
     s.state = {
       id: runId,
       request,
@@ -150,7 +154,7 @@ export class Store {
     t.attempts.push(attempt);
     t.updatedAt = nowISO();
     await this.persist();
-    await this.event("attempt_added", { taskId, attemptId: attempt.id, kind: a.kind, outcome: a.outcome });
+    await this.event("attempt_added", { taskId, attemptId: attempt.id, attemptKind: a.kind, outcome: a.outcome });
     return attempt;
   }
 
@@ -164,7 +168,7 @@ export class Store {
     await this.persist();
     const elapsedMs = Math.max(0, Date.parse(a.endedAt!) - Date.parse(startedAt));
     await this.event("attempt_finished", {
-      taskId, attemptId, kind: a.kind, outcome: a.outcome,
+      taskId, attemptId, attemptKind: a.kind, outcome: a.outcome,
       sessionId: a.sessionId, elapsedMs,
     });
   }

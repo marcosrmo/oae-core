@@ -6,6 +6,8 @@
  *   node src/index.ts plan "<request>" --dir <project>
  *   node src/index.ts status --dir <project>
  *   node src/index.ts report --dir <project>
+ *   node src/index.ts dashboard --dir <project> [--follow] [--detail]
+ *   node src/index.ts history --dir <project>
  *   node src/index.ts init   --dir <project>   (installs .opencode config + skills)
  *   node src/index.ts publish --dir <project> [--repo <name>] [--public]
  *
@@ -23,6 +25,10 @@ import { inspectGit } from "./git.ts";
 import { checkRemote, publish } from "./publish.ts";
 import { installIntoProject } from "./setup.ts";
 import { acquireRunLock, releaseRunLock } from "./runlock.ts";
+import { loadRunView } from "./viewmodel.ts";
+import { renderSummary, renderResultLine, type RenderOptions } from "./dashboard.ts";
+import { listRunHistory, type HistoryEntry } from "./history.ts";
+import { formatDuration } from "./dashboard.ts";
 
 function arg(name: string, i: number, argv: string[]): string | undefined {
   const idx = argv.indexOf(name);
@@ -30,6 +36,17 @@ function arg(name: string, i: number, argv: string[]): string | undefined {
 }
 function flag(name: string, argv: string[]): boolean {
   return argv.includes(name);
+}
+
+const isTTY = process.stdout.isTTY === true;
+const renderOpts: RenderOptions = { colors: isTTY, width: isTTY ? Math.min(160, process.stdout.columns ?? 100) : 100 };
+
+function printEventHistory(runs: HistoryEntry[]): void {
+  for (const r of runs) {
+    const dur = r.durationMs !== undefined ? formatDuration(r.durationMs) : "—";
+    const prov = r.provider ? ` · provider: ${[r.provider.http429 ? `429×${r.provider.http429}` : null, r.provider.http401 ? `401×${r.provider.http401}` : null].filter(Boolean).join(", ")}` : "";
+    console.log(`${r.source === "current" ? "*" : " "} ${r.id.padEnd(16)} ${r.status.padEnd(8)} ${dur.padEnd(7)} tasks ${r.tasksDone}/${r.tasksTotal}${r.tasksBlocked ? ` (blocked: ${r.tasksBlocked})` : ""}${prov}  ${r.request.slice(0, 46)}`);
+  }
 }
 
 async function main(): Promise<number> {
@@ -104,6 +121,48 @@ async function main(): Promise<number> {
       console.log(`run: ${store.state.status}`);
       return 0;
     }
+    case "dashboard":
+    case "watch": {
+      const follow = flag("--follow", argv);
+      const detail = flag("--detail", argv);
+      firstRun: {
+        const view = await loadRunView(dir);
+        if (!view) { console.log("no runs found"); return 1; }
+        if (!follow || !isTTY) {
+          // snapshot + result line: CI/redirect-safe, exits immediately
+          console.log(renderSummary(view, { ...renderOpts, detail }));
+          console.log("");
+          console.log(renderResultLine(view, renderOpts));
+          break firstRun;
+        }
+        // follow mode: refresh only on change (no busy repaints), poll the
+        // local .oae files at 1s — never the OpenCode service, never an LLM
+        process.stdout.write("\x1b[2J\x1b[H");
+        let lastRender = "";
+        for (;;) {
+          const v = await loadRunView(dir);
+          if (v) {
+            const text = renderSummary(v, { ...renderOpts, detail }) + "\n\n" + renderResultLine(v, renderOpts);
+            if (text !== lastRender) {
+              process.stdout.write("\x1b[H\x1b[2J" + text + "\n");
+              lastRender = text;
+            }
+            if (v.status !== "running") {
+              process.stdout.write(`\n(entrada encerrada — ${v.status}). Use \`oae history\` para execuções anteriores.\n`);
+              return v.status === "done" ? 0 : 1;
+            }
+          }
+          await new Promise((r) => { const t = setTimeout(r, 1000); if (process.stdin.isTTY) { const onSig = () => { clearTimeout(t); r(null); }; process.once("SIGINT", onSig); } });
+        }
+      }
+      return 0;
+    }
+    case "history": {
+      const runs = await listRunHistory(dir);
+      if (!runs.length) { console.log("no runs found"); return 1; }
+      printEventHistory(runs);
+      return 0;
+    }
     case "report": {
       const store = await Store.loadLatest(dir);
       if (!store) { console.log("no runs found"); return 1; }
@@ -125,7 +184,7 @@ async function main(): Promise<number> {
       return r.pushed ? 0 : 1;
     }
     default:
-      console.log("commands: run | plan | status | report | init | publish");
+      console.log("commands: run | plan | status | report | init | publish | dashboard | history");
       return 2;
   }
 }
