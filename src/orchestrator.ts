@@ -14,7 +14,7 @@ import type { Plan } from "./planner.ts";
 import { makePlan, detectStack, defaultValidators } from "./planner.ts";
 import { Supervisor, type SweepAction } from "./supervisor.ts";
 import { runValidators, type ValidatorResult } from "./validators.ts";
-import { classifyProviderFailure } from "./events.ts";
+import { classifyProviderFailure, isProviderUnavailableFailure } from "./events.ts";
 import * as git from "./git.ts";
 import { nowISO, truncate, sleep } from "./util.ts";
 
@@ -30,6 +30,8 @@ export interface RunOptions {
   sweepIntervalMs?: number;
   /** Injectable clock for deterministic supervision tests. */
   clock?: { now(): number };
+  /** Injectable wait (provider backoff) for deterministic tests. */
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 const CODER_PROMPT = (task: Task, stack: string, validators: string[], refined?: string) => [
@@ -100,8 +102,11 @@ export class Orchestrator {
     this.client = client;
     this.store = store;
     this.opts = opts;
+    this.sleeper = opts.sleepFn ?? ((ms: number) => sleep(ms));
     this.supervisor = new Supervisor(opts.config.recovery, store, opts.clock ?? { now: () => Date.now() });
   }
+
+  private sleeper: (ms: number) => Promise<void>;
 
   async run(request: string): Promise<{ state: RunState }> {
     const cfg = this.opts.config;
@@ -291,7 +296,7 @@ export class Orchestrator {
       startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
     });
     const revRes = await rev.runner.awaitCompletion(5 * 60_000, (s) =>
-      this.emit("agent_progress", { taskId: task.id, attemptId: revAttempt.id, phase: "review", kind: s.kind, detail: s.detail }));
+      this.emit("agent_progress", { taskId: task.id, attemptId: revAttempt.id, phase: "review", signalKind: s.kind, detail: s.detail }));
     const verdict = parseVerdict(revRes.output);
     const revUsage = await this.collectUsage(rev.runner);
     await this.store.finishAttempt(task.id, revAttempt.id, {
@@ -331,7 +336,9 @@ export class Orchestrator {
       });
       const res = await runner.awaitCompletion(cfg.recovery.taskTimeoutMs - (Date.now() - taskStart), (s) => {
         this.supervisor.noteSignal(task.id, s);
-        this.emit("agent_progress", { taskId: task.id, attemptId: attempt.id, phase: "code", kind: s.kind, detail: s.detail });
+        // `signalKind` (not `kind`): Store.event's spread would otherwise
+        // overwrite the event-type field with the signal kind
+        this.emit("agent_progress", { taskId: task.id, attemptId: attempt.id, phase: "code", signalKind: s.kind, detail: s.detail });
       });
       const usage = await this.collectUsage(runner);
       await this.store.finishAttempt(task.id, attempt.id, {
@@ -352,6 +359,37 @@ export class Orchestrator {
             message: truncate(f.message, 400),
             tokensUnknown: usage === null,
           });
+          // Provider gates (HTTP 429/401) with no confirmed token usage mean
+          // the provider never delivered compute: a bounded provider backoff
+          // preserves the engineering attempt budget (mission §7-G; evidence:
+          // benchmark runs where every attempt died on 429 with 0 tokens).
+          const tokensConsumed = usage ? (usage.input + usage.output + usage.reasoning + usage.cacheRead + usage.cacheWrite) > 0 : false;
+          if (isProviderUnavailableFailure(f) && !tokensConsumed) {
+            const provRetries = this.store.task(task.id).attempts.filter((a) => a.kind === "provider_retry").length;
+            if (provRetries < cfg.recovery.maxProviderRetries) {
+              const waitMs = Math.min(cfg.recovery.providerBackoffMs * 2 ** provRetries, 120_000);
+              await this.store.patchAttempt(task.id, attempt.id, { kind: "provider_retry", outcome: "failed" });
+              await this.store.decide({
+                by: "orchestrator", kind: "technical",
+                text: `Provider unavailable (HTTP ${f.httpStatus}) after attempt ${attemptNo} with no confirmed token usage`,
+                rationale: "provider retry preserves the engineering attempt budget",
+              });
+              this.supervisor.unregister(task.id);
+              this.emit("retry_scheduled", { taskId: task.id, attemptNo, reason: `provider unavailable (HTTP ${f.httpStatus}) — engineering attempt not consumed`, waitMs, providerRetry: provRetries + 1 });
+              await this.sleeper(waitMs);
+              continue;
+            }
+            // gate exhausted: block explicitly, re-classifying the failed
+            // attempt first so the ledger matches the budget claim (it
+            // consumed no confirmed compute either)
+            await this.store.patchAttempt(task.id, attempt.id, { kind: "provider_retry", outcome: "failed" });
+            await this.store.updateTask(task.id, {
+              status: "blocked",
+              blockedReason: `provider unavailable (HTTP ${f.httpStatus}) after ${cfg.recovery.maxProviderRetries} provider retries — engineering attempts preserved`,
+            });
+            this.supervisor.unregister(task.id);
+            return;
+          }
         }
         // supervisor recovery: sweep already produced refined instructions
         refined = this.recoveryContext.get(task.id) ??

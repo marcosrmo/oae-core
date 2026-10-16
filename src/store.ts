@@ -158,6 +158,16 @@ export class Store {
     return attempt;
   }
 
+  /** Non-observational attempt patch (kind/outcome corrections by the orchestrator). */
+  async patchAttempt(taskId: string, attemptId: number, patch: Partial<Attempt>): Promise<void> {
+    const t = this.task(taskId);
+    const a = t.attempts.find((x) => x.id === attemptId);
+    if (!a) throw new Error(`Unknown attempt ${attemptId} on ${taskId}`);
+    Object.assign(a, patch);
+    t.updatedAt = nowISO();
+    await this.persist();
+  }
+
   async finishAttempt(taskId: string, attemptId: number, patch: Partial<Attempt>): Promise<void> {
     const t = this.task(taskId);
     const a = t.attempts.find((x) => x.id === attemptId);

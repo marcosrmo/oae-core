@@ -53,6 +53,7 @@ function fastRecovery(cfg: OaeConfig): OaeConfig {
       pollMs: 3_600_000,   // ticker effectively off; tests sweep manually
       maxAttempts: 3,
       backoffMs: 10,
+      providerBackoffMs: 1, // deterministic, instant provider gates
       taskTimeoutMs: 60_000,
       runTimeoutMs: 5 * 60_000,
       commandTimeoutMs: 30_000,
@@ -871,7 +872,7 @@ test("instrumentation: agents' lifecycle events are typed, classified and comple
     const reasons = retries.map((r) => r.reason);
     assert.deepEqual(reasons, [
       "attempt interrupted (deadline or recovery)",
-      "attempt interrupted (deadline or recovery)",
+      "provider unavailable (HTTP 429) — engineering attempt not consumed",
       "empty coder response",
       "reviewer rejected (rework)",
     ]);
@@ -1087,6 +1088,101 @@ test("CLI: `oae dashboard` renders a snapshot from .oae files; `oae status` beha
     assert.equal(stEmpty.code, 1);
     assert.equal(stEmpty.out.trim(), "no runs found");
   } finally { await rm(dir, { recursive: true, force: true }); await rm(empty, { recursive: true, force: true }); }
+});
+
+test("provider gates: HTTP 429/401 with zero confirmed tokens retries WITHOUT consuming the attempt budget; exhausted gates block the task explicitly", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxAttempts = 2;
+    config.recovery.maxProviderRetries = 2;
+    config.recovery.providerBackoffMs = 1;
+    const store = await Store.create(dir, "run-prov", "provider retry behavior");
+    const PROVIDER_429 = { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 429: rate limited" };
+    const PROVIDER_401 = { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 401: invalid credentials" };
+    // gates: 429 (retry 1) → 401 (retry 2) → exhausted → blocked;
+    // every provider attempt must stay a provider_retry, never kind code
+    const script = [PROVIDER_429, PROVIDER_401];
+    let idx = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => {
+        const step = kind === "coder" ? script[Math.min(idx++, script.length - 1)]! : { outcome: "completed" as const, output: REVIEWER_OK };
+        return scriptedRunner([{ result: step, usage: null }]);
+      },
+    });
+    const { state } = await orch.run("provider retry behavior");
+    assert.equal(state.status, "failed");
+    const task = state.tasks[0]!;
+    assert.equal(task.status, "blocked");
+    assert.ok((task.blockedReason ?? "").includes("provider unavailable"), `blocked reason is explicit about the gate: ${task.blockedReason}`);
+    assert.ok((task.blockedReason ?? "").includes("engineering attempts preserved"), "explicitly documents budget preservation");
+    assert.deepEqual(
+      task.attempts.map((a) => a.kind),
+      ["provider_retry", "provider_retry", "provider_retry"],
+      "gated failures (including the exhausted-gate attempt) never consume kind code attempts",
+    );
+    assert.equal(task.attempts.filter((a) => a.kind === "code").length, 0);
+    assert.equal(task.attempts.filter((a) => a.outcome === "running").length, 0, "no attempt left dangling as running");
+
+    const evs = await readEvents(dir);
+    const retries = evs.filter((e) => e.kind === "retry_scheduled" && String(e.reason).includes("provider unavailable"));
+    assert.equal(retries.length, 2);
+    assert.ok(retries.every((e) => typeof e.providerRetry === "number"));
+    // deterministic exponential waits: base 1ms → 1ms, 2ms
+    assert.deepEqual(retries.map((e) => e.waitMs), [1, 2]);
+    const provErrors = evs.filter((e) => e.kind === "provider_error");
+    assert.deepEqual(provErrors.map((e) => e.httpStatus), [429, 401, 401]);
+    assert.ok(provErrors.every((e) => e.tokensUnknown === true), "zero confirmed usage reported as unknown, not faked 0");
+    void test;
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("provider gates: a successful attempt after provider retries completes the task at attempt 1 of the engineering budget", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxAttempts = 3;
+    config.recovery.maxProviderRetries = 3;
+    config.recovery.providerBackoffMs = 1;
+    const store = await Store.create(dir, "run-prov-ok", "provider then success");
+    let coderIdx = 0;
+    const coder = [
+      { result: { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 429: rate limited" }, usage: null },
+      { result: { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 429: rate limited" }, usage: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+      // tokens consumed mid-session (retry hit after real work) → NOT a gate retry
+      { result: { outcome: "failed" as const, output: "provider/run error: Provider request failed with HTTP 429: rate limited" }, usage: { input: 500, output: 100, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+      { result: { outcome: "completed" as const, output: "RESULT:\nfiles: none\nIMPEDIMENT: none" }, usage: { input: 9, output: 4, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } },
+    ];
+    void coderIdx;
+    let step = 0;
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => {
+        if (kind !== "coder") return scriptedRunner([{ result: { outcome: "completed", output: REVIEWER_OK }, usage: { input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }]);
+        const s = coder[Math.min(step++, coder.length - 1)]!;
+        return scriptedRunner([s]);
+      },
+    });
+    const { state } = await orch.run("provider then success");
+    assert.equal(state.status, "done", "success after provider retries still completes");
+    const task = state.tasks[0]!;
+    assert.deepEqual(task.attempts.map((a) => a.kind), [
+      "provider_retry", // zero tokens → gate retry (attempt budget NOT consumed)
+      "provider_retry", // confirmed zero → confirmed zero is still no compute
+      "code",           // 500 tokens consumed → real engineering attempt (429 stands)
+      "code",           // eventual success
+      "review",         // independent reviewer recorded by runReview
+    ]);
+    assert.equal(task.status, "done");
+    const evs = await readEvents(dir);
+    const gateRetries = evs.filter((e) => e.kind === "retry_scheduled" && String(e.reason).includes("engineering attempt not consumed"));
+    assert.equal(gateRetries.length, 2, "only the zero-consumption failures gated");
+    const engineering429 = evs.filter((e) => e.kind === "retry_scheduled" && String(e.reason).includes("attempt interrupted"));
+    assert.equal(engineering429.length, 1, "a 429 AFTER real compute falls back to the normal interruption path");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("supervisor does not diagnose while progress is recent", async () => {

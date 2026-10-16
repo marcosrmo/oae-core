@@ -27,6 +27,10 @@ export interface RecoveryConfig {
   maxRecoveryCycles: number; // default 2
   /** Re-asks to the reviewer when its verdict is unparseable and validators pass (no coder attempt spent). */
   maxReviewReasks: number; // default 1
+  /** Provider 429/401 gates: retries that preserve the engineering attempt budget. */
+  maxProviderRetries: number; // default 3
+  /** Base wait for provider backoff (doubles per retry, capped at 120 s). */
+  providerBackoffMs: number; // default 30 s
 }
 
 export interface OaeConfig {
@@ -54,6 +58,8 @@ export function defaultRecovery(): RecoveryConfig {
     commandTimeoutMs: 5 * 60_000,
     maxRecoveryCycles: 2,
     maxReviewReasks: 1,
+    maxProviderRetries: 3,
+    providerBackoffMs: 30_000,
   };
 }
 
