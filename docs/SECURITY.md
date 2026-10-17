@@ -14,9 +14,33 @@ contains credentials.
 ## Agent permissions
 
 - **Reviewer agent (`oae-reviewer`)** — read-only by construction. Its agent
-  definition (installed into the target project by `oae init`) denies `edit` and
-  `write`. It can read code, run commands and inspect git state, but cannot mutate
-  the repository.
+  definition (installed into the target project by `oae init`) uses the singular
+  `agent` config key with a `permission` map denying `edit`, `write`, `task`,
+  `webfetch`, `websearch` and `browser`.
+
+  **Bash allowlist — exact strings only (audit 2026-10-17).** The allowlist keeps
+  `"*": "deny"` and allows only full fixed commands: `git status`, `pwd`, `ls`,
+  `npm test`, `node --version`. Rationale, proven by live negative tests against
+  the OpenCode 1.19.3 server: the server matches a command by its first token
+  against each pattern, so any wildcard entry (e.g. `cat *`, `grep *`,
+  `git diff*`) let the reviewer write files via shell redirection and pipes —
+  `grep 123 > f.txt`, `git diff > f.txt`, `cat f | tee f2.txt` and
+  `cat > f.js << EOF … EOF` all executed with write side effects. After the fix,
+  the same vectors returned `error/blocked` (tool state) and no files were
+  created (verified: `hack*` file count 0 in the test project). File reading by
+  the reviewer is expected to use OpenCode's native read/glob/grep tools, which
+  are not shell-mediated.
+
+  **Resolution-key hazard (fixed).** On OpenCode 1.19.x the plural `agents`
+  config key is partially merged and the `permission` map inside it is silently
+  dropped — with the legacy key the reviewer ran with `edit`/`write` enabled.
+  `oae init` now writes the singular `agent` key and purges any legacy
+  `agents.oae-reviewer` entry. Resolution is asserted via
+  `opencode debug agent oae-reviewer` (tools deny: True) and by end-to-end
+  negative tests through real API sessions against the 1.19.3 server
+  (2026-10-17; evidence scripts under `/tmp/oae-work/negtest*.mjs`, see
+  `docs/TEST_REPORT.md` "Lab audit" section).
+
 - **Coder agent** — the OpenCode `build` agent under OpenCode's own permission
   system. File mutations are additionally contained by the git branch
   (`oae/auto-<runid>`) and the baseline-preservation rules below.
