@@ -17,17 +17,43 @@ export async function installIntoProject(projectDir: string): Promise<void> {
   let existing: Record<string, unknown> = {};
   try { existing = JSON.parse(await readFile(cfgFile, "utf8")) as Record<string, unknown>; } catch { /* new file */ }
   existing.$schema = "https://opencode.ai/config.json";
-  existing.agents = {
-    ...((existing.agents as Record<string, unknown>) ?? {}),
+  // purge the legacy `agents` (plural) entry — on OpenCode 1.19.x it is
+  // partially merged and the permission map is silently dropped, so the
+  // reviewer would run with edit/write enabled
+  if (existing.agents && typeof existing.agents === "object") {
+    const legacy = existing.agents as Record<string, unknown>;
+    if ("oae-reviewer" in legacy) {
+      delete legacy["oae-reviewer"];
+      if (Object.keys(legacy).length === 0) delete existing.agents;
+    }
+  }
+  existing.agent = {
+    ...((existing.agent as Record<string, unknown>) ?? {}),
     "oae-reviewer": {
       description: "OAE independent reviewer: read-only, runs validators, returns a verdict JSON.",
       mode: "subagent",
-      permissions: [
-        { action: "*", resource: "*", effect: "allow" },
-        { action: "edit", resource: "*", effect: "deny" },
-        { action: "write", resource: "*", effect: "deny" },
-        { action: "browser", resource: "*", effect: "deny" },
-      ],
+      permission: {
+        "*": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "task": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "browser": "deny",
+        "bash": {
+          // auditoria 2026-10-17: padrões com wildcard escapam escrita por
+          // redirect/pipes compostos (`grep x > f`, `git diff > f`,
+          // `cat f | tee g` todos EXECUTARAM com "cat *"/"grep *"/"git diff*").
+          // Portanto somente strings exatas — leitura de arquivos fica com as
+          // tools nativas (read/glob/grep), que não são afetadas por shell.
+          "*": "deny",
+          "git status": "allow",
+          "pwd": "allow",
+          "ls": "allow",
+          "npm test": "allow",
+          "node --version": "allow",
+        },
+      },
     },
   };
   await writeFile(cfgFile, JSON.stringify(existing, null, 2), "utf8");

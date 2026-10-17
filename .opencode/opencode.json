@@ -1,31 +1,26 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "agents": {
+  "agent": {
     "oae-reviewer": {
       "description": "OAE independent reviewer: read-only, runs validators, returns a verdict JSON.",
       "mode": "subagent",
-      "permissions": [
-        {
-          "action": "*",
-          "resource": "*",
-          "effect": "allow"
-        },
-        {
-          "action": "edit",
-          "resource": "*",
-          "effect": "deny"
-        },
-        {
-          "action": "write",
-          "resource": "*",
-          "effect": "deny"
-        },
-        {
-          "action": "browser",
-          "resource": "*",
-          "effect": "deny"
+      "permission": {
+        "*": "allow",
+        "edit": "deny",
+        "write": "deny",
+        "task": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "browser": "deny",
+        "bash": {
+          "*": "deny",
+          "git status": "allow",
+          "pwd": "allow",
+          "ls": "allow",
+          "npm test": "allow",
+          "node --version": "allow"
         }
-      ]
+      }
     }
   }
 }
