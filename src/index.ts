@@ -33,12 +33,26 @@ import { renderSummary, renderResultLine, type RenderOptions } from "./dashboard
 import { listRunHistory, type HistoryEntry } from "./history.ts";
 import { formatDuration } from "./dashboard.ts";
 
-function arg(name: string, i: number, argv: string[]): string | undefined {
+function arg(name: string, argv: string[]): string | undefined {
   const idx = argv.indexOf(name);
-  return idx >= 0 ? argv[idx + 1] : i >= 0 ? undefined : undefined;
+  return idx >= 0 ? argv[idx + 1] : undefined;
 }
 function flag(name: string, argv: string[]): boolean {
   return argv.includes(name);
+}
+
+/** Flags that take a value — their argument is consumed, never read as prose. */
+const VALUE_FLAGS = new Set(["--dir", "--model", "--repo", "--concurrency"]);
+
+/** First non-flag token after the command, skipping the values of known value flags. */
+function requestArg(argv: string[]): string | undefined {
+  for (let i = 0; i < argv.length; i++) {
+    const t = argv[i]!;
+    if (VALUE_FLAGS.has(t)) { i++; continue; }
+    if (t.startsWith("--")) continue;
+    return t;
+  }
+  return undefined;
 }
 
 const isTTY = process.stdout.isTTY === true;
@@ -55,11 +69,11 @@ function printEventHistory(runs: HistoryEntry[]): void {
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
-  const dir = resolve(arg("--dir", 0, argv) ?? process.cwd());
+  const dir = resolve(arg("--dir", argv) ?? process.cwd());
   const configBase = await loadConfig(dir);
 
   if (flag("--model", argv)) {
-    const m = arg("--model", 0, argv);
+    const m = arg("--model", argv);
     if (m && m.includes("/")) {
       const [providerID, ...rest] = m.split("/");
       configBase.model = { providerID, id: rest.join("/") };
@@ -68,9 +82,9 @@ async function main(): Promise<number> {
 
   switch (cmd) {
     case "run": {
-      const request = argv.slice(1).filter((a) => !a.startsWith("--") && a !== argv[argv.indexOf("--dir") + 1])[0];
+      const request = requestArg(argv.slice(1));
       if (!request) { console.error('usage: oae run "<request>" --dir <project>'); return 2; }
-      const config = { ...configBase, concurrency: Number(arg("--concurrency", 0, argv) ?? configBase.concurrency) };
+      const config = { ...configBase, concurrency: Number(arg("--concurrency", argv) ?? configBase.concurrency) };
       await mkdir(join(dir, ".oae"), { recursive: true });
       // one run per directory — deterministic anti-recursion backstop (D13)
       const runId = `run-${Date.now().toString(36)}`;
@@ -134,7 +148,7 @@ async function main(): Promise<number> {
       }
     }
     case "plan": {
-      const request = argv.slice(1).filter((a) => !a.startsWith("--"))[0] ?? "";
+      const request = requestArg(argv.slice(1)) ?? "";
       const config = configBase;
       await mkdir(join(dir, ".oae"), { recursive: true });
       const runId = `plan-${Date.now().toString(36)}`;
@@ -239,7 +253,7 @@ async function main(): Promise<number> {
     case "publish": {
       const remote = await checkRemote(configBase);
       console.log(`remote: ${remote.hasRemote ? remote.url : "none"}`);
-      const repoName = arg("--repo", 0, argv) ?? "opencode-autonomous-engineering";
+      const repoName = arg("--repo", argv) ?? "opencode-autonomous-engineering";
       const st = await inspectGit(dir);
       const r = await publish(configBase, repoName, { createRepo: !remote.hasRemote, private: !flag("--public", argv) });
       console.log(r.pushed ? `pushed ${st.branch} → ${r.repoUrl}` : `publish failed: ${r.error}`);

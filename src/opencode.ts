@@ -31,9 +31,149 @@ import { nowISO, truncate } from "./util.ts";
 export type Client = OpenCodeClient;
 
 export async function connect(): Promise<{ client: Client; endpoint: Endpoint }> {
-  const endpoint = await Service.ensure();
-  const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
+  // Explicit endpoint mode: some installed CLI builds (e.g. opencode-ai 1.x)
+  // predate `opencode serve --service`, so Service.ensure() cannot spawn /
+  // discover / health-probe them. Point OAE at an already-running service with
+  // OAE_OPENCODE_URL=http://host:port — verified with a cheap health probe.
+  const explicitUrl = process.env.OAE_OPENCODE_URL;
+  let endpoint: Endpoint;
+  let client: Client;
+  if (explicitUrl) {
+    const url = new URL(explicitUrl).toString().replace(/\/$/, "") + "/";
+    const probe = await fetch(new URL("/api/health", url)).catch(() => undefined);
+    if (!probe || !probe.ok) {
+      throw new Error(`OAE_OPENCODE_URL=${explicitUrl}: /api/health probe failed (${probe?.status ?? "no response"})`);
+    }
+    endpoint = { url } as unknown as Endpoint;
+    client = OpenCode.make({ baseUrl: endpoint.url });
+  } else {
+    endpoint = await Service.ensure();
+    client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) });
+  }
+  if (explicitUrl) {
+    // adapter mode only: 1.x wire shims never touch the native v2 integration
+    applyPromptCompatibility(client, endpoint.url);
+    applyEventCompatibility(client);
+  }
   return { client, endpoint };
+}
+
+/**
+ * Wire compatibility shim. opencode-ai 1.x servers validate
+ * POST /api/session/{id}/prompt as {sessionID, prompt:{text}}, while
+ * @opencode/client 2.0.x sends the older {id, text} envelope, which the server
+ * rejects with `Missing key at ["prompt"]` (probe 2026-10-17: client 2.0.29 and
+ * 2.0.32 vs servers 1.19.3 / 0.0.0-dev-202610161232). Route the OAE prompt
+ * calls through the accepted wire format, transparently to AgentRunner.
+ */
+function applyPromptCompatibility(client: Client, baseUrl: string): void {
+  const session = client.session as unknown as {
+    prompt: ((input: { sessionID: string; text: string }) => Promise<unknown>) | undefined;
+  };
+  const original = session.prompt;
+  session.prompt = async (input: { sessionID: string; text: string }) => {
+    try {
+      return await original?.call(client.session, input);
+    } catch (err) {
+      // retry on the server's expected shape once — a real transport error
+      // (refused connection) is re-raised as-is so the caller sees the truth
+      const message = String((err as Error)?.message ?? err);
+      if (!/prompt/i.test(message)) throw err;
+      const res = await fetch(new URL(`/api/session/${input.sessionID}/prompt`, baseUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionID: input.sessionID, prompt: { text: input.text } }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`session.prompt failed (${res.status}): ${body.slice(0, 300)}`);
+      }
+      return await res.json().catch(() => undefined);
+    }
+  };
+}
+
+/**
+ * Event stream compatibility shim (1.x servers, adapter mode only).
+ * opencode-ai 1.x emits a `session.next.*` event vocabulary and has NO terminal
+ * `session.idle`/`session.status` (probe 2026-10-17: full turn = prompt.admitted,
+ * prompted, step.started, reasoning.* , text.*, step.ended — then silence).
+ * Translate it into the v2-shaped events the OAE consumes:
+ *  - step starts pass through as `session.step.started`;
+ *  - step ends pass through as `session.step.ended`, and 25s of silence after
+ *    the last one is reported as `session.idle` (turn over → settle). The
+ *    threshold is live-calibrated: observed inter-step gaps reach ~14s on the
+ *    lab provider — an 8s debounce settled sessions mid-stream, producing
+ *    empty/parcial results ("unparseable" reviews) before this was raised.
+ *  - in-stream deltas surface as a throttled (≥15s) `session.step.started`
+ *    keepalive so the supervisor sees verifiable progress, not an event storm.
+ */
+type EvmStream = AsyncIterable<unknown>;
+const ADAPTER_IDLE_SILENCE_MS = 25_000;
+const ADAPTER_KEEPALIVE_MS = 15_000;
+
+function applyEventCompatibility(client: Client): void {
+  const holder = client as unknown as { event?: { subscribe?: (o?: unknown) => EvmStream } };
+  const subscribe = holder.event?.subscribe;
+  if (typeof subscribe !== "function") return;
+  holder.event = { subscribe: (o?: unknown) => translateEventStream(subscribe.call(holder.event, o)) };
+}
+
+/** Async wrapper that injects synthetic v2 events without touching the native path. */
+const EMPTY_STREAM: AsyncIterable<unknown> = {
+  async *[Symbol.asyncIterator]() {},
+};
+function translateEventStream(inner: EvmStream | undefined): EvmStream {
+  if (!inner || typeof inner[Symbol.asyncIterator] !== "function") return EMPTY_STREAM;
+  const it = (inner as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+  let lastKeepalive = 0;
+  let pendingEnd: { sessionID: string; at: number } | null = null;
+  const map = (raw: unknown): unknown[] | null => {
+    const e = raw as { type?: string; data?: Record<string, unknown> };
+    if (!e || typeof e.type !== "string") return null;
+    const passthrough = (type: string): unknown[] => [{ type, data: e.data }];
+    switch (e.type) {
+      case "session.next.step.started":
+        pendingEnd = null;
+        return passthrough("session.step.started");
+      case "session.next.step.ended":
+        pendingEnd = { sessionID: String(e.data?.sessionID ?? ""), at: Date.now() };
+        return passthrough("session.step.ended");
+      default: {
+        // deltas/reflections and any other 1.x vocabulary: progress keepalive
+        const now = Date.now();
+        if (now - lastKeepalive < ADAPTER_KEEPALIVE_MS) return null;
+        lastKeepalive = now;
+        return e.data?.sessionID ? passthrough("session.step.started") : null;
+      }
+    }
+  };
+  const out: AsyncIterable<unknown> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<unknown>> {
+          for (;;) {
+            if (pendingEnd && Date.now() - pendingEnd.at >= ADAPTER_IDLE_SILENCE_MS) {
+              const idle: unknown = { type: "session.idle", data: { sessionID: pendingEnd.sessionID } };
+              pendingEnd = null;
+              return { value: idle, done: false };
+            }
+            const raced = await Promise.race([
+              it.next().then((r: IteratorResult<unknown>) => ({ r })),
+              new Promise((res) => setTimeout(() => res(null), 1_000)),
+            ]);
+            if (!raced) continue;
+            const r = (raced as { r: IteratorResult<unknown> }).r;
+            if (r.done) return { done: true, value: undefined } as IteratorResult<unknown>;
+            const mapped = map(r.value);
+            if (!mapped) continue;
+            for (const e of mapped) return { value: e, done: false };
+          }
+        },
+      };
+    },
+  };
+  return out;
 }
 
 export interface ProgressSignal {
