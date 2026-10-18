@@ -1,0 +1,55 @@
+{
+ "phases": {
+  "health": {
+   "phase": "health",
+   "status": 200,
+   "ms": 356,
+   "body": "{\"healthy\":true,\"version\":\"1.19.3\"}"
+  },
+  "mcp_before": {
+   "status": 200,
+   "body": "{\"rea\":{\"status\":\"connected\"}}",
+   "ms": 48
+  },
+  "mcp_warmup": {
+   "skipped": true
+  },
+  "session": {
+   "id": "ses_eb3dfc02dffe7tTiLHC1Z6eXZY",
+   "directory": "/tmp/oae-work",
+   "status": 200,
+   "ms": 1466
+  },
+  "prompt": {
+   "status": 204,
+   "ms": 782,
+   "body": ""
+  },
+  "turn": {
+   "events": 102,
+   "sessionEvents": 40,
+   "typeCounts": {
+    "server.connected": 1,
+    "session.updated": 4,
+    "message.updated": 7,
+    "message.part.updated": 8,
+    "server.heartbeat": 9,
+    "session.status": 4,
+    "session.diff": 2,
+    "plugin.added": 45,
+    "catalog.updated": 3,
+    "reference.updated": 2,
+    "integration.updated": 2,
+    "message.part.delta": 15
+   },
+   "toolCalls": [],
+   "terminal": "se_err_The operation was aborted due ",
+   "ms": 204448
+  },
+  "messages": {
+   "status": "ERR",
+   "ms": 33340
+  }
+ },
+ "total_ms": 241970
+}
