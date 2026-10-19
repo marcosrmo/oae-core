@@ -487,6 +487,19 @@ export class Orchestrator {
 
       // --- done: commit on the run branch ---
       const commit = await git.commitAll(cfg.projectDir, `oae(${task.id}): ${task.title}`, this.baselineUncommitted);
+      if (commit.error) {
+        // A real commit failure must never be reported as a completed task.
+        // The agent's work stays on the run branch (uncommitted, never
+        // discarded); the task is blocked with the recorded error.
+        await this.store.decide({
+          by: "orchestrator", kind: "technical",
+          text: `Commit failed for task ${task.id}; task blocked, work preserved uncommitted on the run branch`,
+          rationale: `commitAll error: ${commit.error}`,
+        });
+        await this.store.updateTask(task.id, { status: "blocked", blockedReason: `commit failed: ${commit.error}` });
+        this.supervisor.unregister(task.id);
+        return;
+      }
       await this.store.updateTask(task.id, { status: "done", commit: commit.commit });
       await this.store.decide({
         by: "orchestrator", kind: "technical",

@@ -20,6 +20,17 @@ export interface GitStatus {
 
 const GIT_TIMEOUT = 120_000;
 
+/**
+ * Command-scoped Git identity for every commit OAE creates. Passed as
+ * `-c key=value` per invocation, so this never reads/writes global, system or
+ * repo config — it applies to that single commit command only. Keeps commits
+ * working in environments with no configured identity (CI, containers).
+ */
+const COMMIT_IDENTITY_ARGS = [
+  "-c", "user.name=OAE Autonomous",
+  "-c", "user.email=oae@autonomous.local",
+];
+
 async function git(dir: string, ...args: string[]) {
   return runCommand("git", args, { cwd: dir, timeoutMs: GIT_TIMEOUT });
 }
@@ -55,7 +66,7 @@ export async function prepareGit(dir: string): Promise<{ status: GitStatus; bran
     await git(dir, "init", "-b", "main");
     st = await inspectGit(dir);
     const add = await git(dir, "add", "-A");
-    const first = await git(dir, "commit", "-m", "chore: baseline before autonomous run");
+    const first = await git(dir, ...COMMIT_IDENTITY_ARGS, "commit", "-m", "chore: baseline before autonomous run");
     if (first.code !== 0 && add.code !== 0) {
       // empty repo, nothing to commit — fine
     }
@@ -71,7 +82,7 @@ export async function prepareGit(dir: string): Promise<{ status: GitStatus; bran
     .filter((f) => !f.startsWith(".oae"));
   if (!st.hasCommits) {
     await git(dir, "add", "-A");
-    await git(dir, "commit", "-m", "chore: baseline before autonomous run");
+    await git(dir, ...COMMIT_IDENTITY_ARGS, "commit", "-m", "chore: baseline before autonomous run");
     st = await inspectGit(dir);
   }
   // dedicated working branch; user's current branch stays untouched
@@ -93,11 +104,13 @@ export async function commitAll(dir: string, message: string, exclude: string[] 
   for (const path of exclude) {
     await git(dir, "restore", "--staged", "--", path);
   }
-  const c = await git(dir, "commit", "-m", message);
+  const c = await git(dir, ...COMMIT_IDENTITY_ARGS, "commit", "-m", message);
   if (c.code !== 0) {
     // nothing to commit is not an error for empty tasks
     if (/nothing to commit/.test(c.stdout + c.stderr)) return { commit: undefined };
-    return { error: (c.stderr || c.stdout).slice(0, 500) };
+    // a failing pre-commit hook can abort the commit with no output at all —
+    // the error must still be truthy so callers never mistake it for success
+    return { error: ((c.stderr || c.stdout).trim() || `git commit exited with code ${c.code}`).slice(0, 500) };
   }
   const h = await git(dir, "rev-parse", "HEAD");
   return { commit: h.stdout.trim() };

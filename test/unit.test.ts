@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -15,7 +15,7 @@ import type { Plan } from "../src/planner.ts";
 import { makePlan } from "../src/planner.ts";
 import { FakeRunner, REVIEWER_OK, REVIEWER_REJECT } from "./fake.ts";
 import { renderReport } from "../src/report.ts";
-import { inspectGit } from "../src/git.ts";
+import { inspectGit, prepareGit, commitAll } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
@@ -480,6 +480,107 @@ test("git preservation: user uncommitted work is never committed by OAE", async 
         m.execFileSync("git", ["show", "--name-only", "--format=", commit], { cwd: dir }).toString());
       assert.ok(!show.includes("user-note.txt"), "OAE commit must not contain user baseline files");
     }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/** Point git's global/system config lookup at /dev/null for the git processes
+ * spawned during a test — simulates a machine with no configured identity.
+ * Only affects this test's child processes; no git config is ever modified. */
+function withoutGitIdentity<T>(fn: () => Promise<T>): Promise<T> {
+  const prevGlobal = process.env.GIT_CONFIG_GLOBAL;
+  const prevSystem = process.env.GIT_CONFIG_SYSTEM;
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+  return fn().finally(() => {
+    if (prevGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = prevGlobal;
+    if (prevSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+    else process.env.GIT_CONFIG_SYSTEM = prevSystem;
+  });
+}
+
+test("git identity: prepareGit and commitAll create real commits with no configured identity", async () => {
+  const dir = await makeProject();
+  await withoutGitIdentity(async () => {
+    try {
+      // a file with content, mirroring real runs (.oae state exists before prepareGit)
+      await writeFile(join(dir, "project-file.txt"), "content");
+      const prep = await prepareGit(dir);
+      const st = await inspectGit(dir);
+      assert.equal(st.isRepo, true);
+      assert.equal(st.hasCommits, true, "baseline commit created despite missing user.name/user.email");
+      assert.ok(st.head && /^[0-9a-f]{40}$/.test(st.head), "baseline commit has a valid hash");
+      assert.ok(prep.branch?.startsWith("oae/auto-"), "run branch created");
+
+      // commits carry the command-scoped OAE identity (author and committer)
+      const { execFileSync } = await import("node:child_process");
+      const author = execFileSync("git", ["log", "-1", "--format=%an"], { cwd: dir }).toString().trim();
+      const committer = execFileSync("git", ["log", "-1", "--format=%cn"], { cwd: dir }).toString().trim();
+      assert.equal(author, "OAE Autonomous");
+      assert.equal(committer, "OAE Autonomous");
+
+      // task commit path
+      await writeFile(join(dir, "task-change.txt"), "task work");
+      const c = await commitAll(dir, "oae(task-1): test commit");
+      assert.ok(c.commit && /^[0-9a-f]{40}$/.test(c.commit), "commitAll returns a real commit hash");
+      const cAuthor = execFileSync("git", ["log", "-1", "--format=%an"], { cwd: dir }).toString().trim();
+      assert.equal(cAuthor, "OAE Autonomous");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
+
+test("git commit: approved task produces a real commit hash (no identity configured)", async () => {
+  const dir = await makeProject();
+  await withoutGitIdentity(async () => {
+    try {
+      const config = fastRecovery(await loadConfig(dir));
+      config.validators = [{ name: "noop", cmd: "node", args: ["-e", "0"] }];
+      const store = await Store.create(dir, "run-commit-hash", "commit hash regression");
+      const orch = new Orchestrator(null, store, {
+        config,
+        plan: plan1(dir),
+        runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+      });
+      const { state } = await orch.run("commit hash regression");
+      const t = state.tasks[0];
+      assert.equal(t.status, "done");
+      assert.ok(t.commit && /^[0-9a-f]{40}$/.test(t.commit), "done task carries a valid commit hash");
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+});
+
+test("git commit failure: task is blocked with the error recorded, never reported done", async () => {
+  const dir = await makeProject();
+  try {
+    // existing repo with one initial commit (identity scoped to this command)
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["init", "-b", "main"], { cwd: dir });
+    execFileSync("git", ["add", "-A"], { cwd: dir });
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "base"], { cwd: dir });
+    // deterministic commit failure: a pre-commit hook that always fails
+    await mkdir(join(dir, ".git", "hooks"), { recursive: true });
+    const hook = join(dir, ".git", "hooks", "pre-commit");
+    await writeFile(hook, "#!/bin/sh\nexit 1\n");
+    await chmod(hook, 0o755);
+
+    const config = fastRecovery(await loadConfig(dir));
+    config.validators = [{ name: "noop", cmd: "node", args: ["-e", "0"] }];
+    const store = await Store.create(dir, "run-commit-fail", "commit failure handling");
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+    });
+    const { state } = await orch.run("commit failure handling");
+    const t = state.tasks[0];
+    assert.notEqual(t.status, "done", "a failed commit must never be a done task");
+    assert.equal(t.status, "blocked");
+    assert.ok(!t.commit, "no commit hash recorded when the commit failed");
+    assert.ok((t.blockedReason ?? "").includes("commit failed"), "blockedReason records the commit error");
+    assert.ok(
+      state.decisions.some((d) => d.text.includes("Commit failed") && d.rationale?.includes("commitAll error")),
+      "failure recorded as an orchestrator decision",
+    );
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
