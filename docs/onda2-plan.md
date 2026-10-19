@@ -1,8 +1,45 @@
 # Onda 2 — Providers diretos NVIDIA/OpenRouter (planejamento)
 
-Status: **planejado, não implementado**. Este documento fixa o desenho técnico
+Status: **etapa 1 (provider NVIDIA direto) IMPLEMENTADA, com teste real NVIDIA
+APROVADO (2026-10-19, 1 execução — evidências em `/tmp/opencode/oae-w2c/.oae/`,
+run `nvidia/z-ai/glm-5.3-flash`, tools locais exercitadas, telemetria real,
+zero segredos em artefatos; sem commit/push nesta onda — revisão local primeiro)**.
+Gap ainda não validado em produção: fallback não-streaming (stick) coberto
+apenas por testes sintéticos; e o planner real via `nvidia-direct` com tools
+desligadas não foi chamado no teste real (o plano mínimo determinístico
+fallback cobriu a pequena tarefa). Este documento fixa o desenho técnico
 para que a Onda 2 execute um provider por vez (NVIDIA primeiro), reutilizando
 a fronteira de contratos consolidada na Onda 1.
+
+Limites residuais documentados (auditoria 2026-10-19): F8 — TOCTOU lstat→write
+não é atômico; hardlinks e bind-mounts não são detectáveis pelo realpath
+(sandbox completo é Onda 3); um `open()` em FIFO não é cancelável pelo
+AbortSignal no nível do SO, por isso o runner settle independentemente da
+tool (corrida de parada) e descarta resoluções tardias. F10 (pré-existente):
+`filesChanged` da tentativa inclui `.oae/`.
+
+Restrição arquitetural no runner direto (auditoria 2026-10-19, achado A2):
+no pump do `HttpAgentRunner`, o trecho entre a troca de `pendingUser`
+(`const pending = this.pendingUser; this.pendingUser = []`) e o
+`settle("completed")` deve permanecer SÍNCRONO — não há `await` entre eles e
+por isso um prompt() aceito enquanto `running` ou é drenado no próximo ciclo
+do ramo final ou rejeita após o settle (nenhuma janela de descarte). Não
+introduzir `await` nesse trecho sem reavaliar a lógica de drenagem da fila
+e a nota de follow-up descartado (`droppedFollowUpsNote`): se um await
+intercalar a troca, um follow-up poderia ficar em pendingUser já trocado
+quando o terminal for `completed` — o único call site de settle sem nota.
+Nenhum comportamento de execução foi alterado por esta restrição; ela é uma
+trava arquitetural contra refactors futuros. Achados residuais da mesma auditoria não
+corrigidos aqui (fora do escopo desta tarefa): A1 (readExcerpt/readAll
+materializam o corpo inteiro antes do cap), A3 (contagem ±1 char em corte
+mid-codepoint, cosmético) e A4 (cap de slots ausente no parse non-streaming).
+
+Nota de adaptação (plano → código real): a tabela HTTP canônica foi consolidada
+em `contracts.ts` (`classifyHttpFailure`: 401/403→auth, 429→rateLimit,
+5xx→unavailable, 4xx→protocol) e `classifyProviderError` delega a ela — uma
+única fonte de regras para os dois caminhos (adapter opencode e transporte
+direto). 5xx é `unavailable` (plano §3) e a semântica única substitui a
+classificação "protocol" de 5xx herdada do motor de mensagens.
 
 ## 1. Interfaces e módulos a reutilizar (já em `main`)
 
@@ -10,15 +47,17 @@ a fronteira de contratos consolidada na Onda 1.
 |---|---|
 | `src/contracts.ts` | `AgentRunner`, `SessionOptions`, `ProviderError` + `classifyProviderError` (motor único; F5) — a normalização de erros dos providers diretos desova aqui por construção |
 | `src/providers/contract.ts` | `Provider { id, createSession, healthCheck? }` — ponto de entrada de cada backend |
-| `src/runtime.ts` | fábrica única: estende para resolver `providerID` (`opencode` \| `nvidia-direct` \| `openrouter-direct`) a partir da configuração; nenhum outro site instancia provider |
+| `src/runtime.ts` | fábrica única: resolve `OAE_PROVIDER` / `--provider` (`opencode` \| `nvidia-direct`; OpenRouter depois); seleção desconhecida falha cedo; `nvidia-direct` não importa/inicia nada do OpenCode (imports dinâmicos carregam só o adaptador escolhido). `index.ts` adiciona `--provider` (default histórico preservado) nas fábricas de `run` e `plan`. |
 | `src/sessions/writer.ts` | rollout append-only por tentativa — reuso sem alteração (com fencing de cauda rasgada, F2) |
 | `src/orchestrator.ts` / `src/planner.ts` | **inalterados**: consomem `Provider`; gates de falha (429/401) já operam sobre `classifyProviderFailure` |
 | `src/store.ts` | `schemaVersion: 1` acretivo — sem mudança de esquema para a Onda 2 |
 
-Novos módulos:
-- `src/providers/http/transport.ts` — cliente HTTP compartilhável (chat-completions, streaming SSE) com `fetch` injetável para testes.
-- `src/providers/http/runner.ts` — `HttpAgentRunner implements AgentRunner`: converte o ciclo conversacional localizado (array de mensagens) em `awaitCompletion`/`interrupt`/`transcriptTail`.
-- `src/providers/nvidia.ts` e `src/providers/openrouter.ts` — adapters finos: baseURL, header de auth, id de modelo, quirks de cada API. Nenhuma lógica compartilhada duplicada.
+Novos módulos (etapa 1 — implementados):
+- `src/providers/http/transport.ts` — cliente HTTP compartilhável (chat-completions, streaming SSE, fallback não-streaming em 400 "stream", `fetch` injetável, buffers limitados, erros redigidos).
+- `src/providers/http/runner.ts` — `HttpAgentRunner implements AgentRunner`: array de mensagens como sessão; primeiro prompt despachado em `begin()` (falha de dispatch rejeita na criação — paridade com OpenCodeRunner); loop de tool-calls por rodadas; usage agregado; ordem de settle única.
+- `src/providers/http/filetools.ts` — FileToolSet (read_file/write_file/list_dir) com confinamento canônico à raiz, proudimentos estritos, negação de symlinks, `.oae/.opencode` somente leitura e caps de E/S.
+- `src/providers/nvidia.ts` — adaptador NVIDIA fino (`nvidia-direct`): `OAE_NVIDIA_API_KEY` do ambiente (erro claro sem segredo quando ausente), healthCheck barato sem chamada de modelo.
+- `src/openrouter.ts` — planejado para etapa posterior sobre o mesmo transporte.
 
 ## 2. Autenticação (sem revelar nem modificar segredos)
 

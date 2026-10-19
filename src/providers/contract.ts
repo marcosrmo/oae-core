@@ -30,6 +30,15 @@ export interface SessionOptions {
   agent: string;
   /** Explicit model selection; null = runtime default. */
   model?: ProviderModelRef | null;
+  /** Enable the provider's own local file tools for this session (direct
+   * providers have no built-in agent tooling; only the coder needs them).
+   * Additive and optional: adapters without tool support ignore it. */
+  tools?: boolean;
+  /** Test seam (direct providers): replace the file-tool executor with a
+   * stub (deterministic non-cooperative tools, without FIFOs/hung processes). */
+  toolExecutor?: { execute(name: string, rawArgs: string, signal?: AbortSignal): Promise<string> };
+  /** Test seam (direct providers): override the tool-call round budget. */
+  maxToolRounds?: number;
   /** First user text dispatched at creation (awaited; rejects surface immediately). */
   promptText: string;
 }

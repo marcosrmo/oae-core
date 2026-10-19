@@ -46,6 +46,7 @@ const RESET = "\x1b[0m";
 export function redact(s: string): string {
   return s
     .replace(/(bearer\s+)[A-Za-z0-9._\-]{8,}/gi, "$1[redacted]")
+    .replace(/\bnvapi-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
     .replace(/\bsk-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
     .replace(/\b(sk|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_\-]{8,}/g, "[redacted]")
     .replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "[redacted]")

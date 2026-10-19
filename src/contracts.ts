@@ -81,6 +81,20 @@ export class ProviderError extends Error {
   }
 }
 
+/**
+ * Canonical HTTP status → ProviderErrorKind table. ONE table for every
+ * provider transport (Onda 2 direct adapters consume exactly this); message
+ * heuristics stay in classifyProviderError on top of it. 401/403 → auth,
+ * 429 → rateLimit, 5xx → unavailable, 4xx → protocol.
+ */
+export function classifyHttpFailure(status: number): ProviderErrorKind {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 429) return "rateLimit";
+  if (status >= 500) return "unavailable";
+  if (status >= 400) return "protocol";
+  return "unknown";
+}
+
 /** Maps a thrown error (or raw message) into the categorized contract. */
 export function classifyProviderError(err: unknown, provider: string): ProviderError {
   if (err instanceof ProviderError) return err;
@@ -91,6 +105,6 @@ export function classifyProviderError(err: unknown, provider: string): ProviderE
   if (status === 401 || status === 403 || /unauthori[sz]ed|auth/i.test(message)) kind = "auth";
   else if (status === 429 || /rate limit/i.test(message)) kind = "rateLimit";
   else if (/unavailable|ENOTFOUND|ECONNREFUSED|ECONNRESET|timeout|no response/i.test(message)) kind = "unavailable";
-  else if (status !== undefined) kind = "protocol";
+  else if (status !== undefined) kind = classifyHttpFailure(status);
   return new ProviderError(kind, provider, message, status);
 }

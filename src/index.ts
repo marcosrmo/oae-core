@@ -20,7 +20,7 @@ import { sleep } from "./util.ts";
 import { loadConfig, defaultConfig } from "./config.ts";
 import { Store } from "./store.ts";
 import { Orchestrator, type RunOptions } from "./orchestrator.ts";
-import { createRuntime } from "./runtime.ts";
+import { createRuntime, normalizeProviderSelection } from "./runtime.ts";
 import { renderReport } from "./report.ts";
 import { inspectGit } from "./git.ts";
 import { checkRemote, publish } from "./publish.ts";
@@ -42,7 +42,7 @@ function flag(name: string, argv: string[]): boolean {
 }
 
 /** Flags that take a value — their argument is consumed, never read as prose. */
-const VALUE_FLAGS = new Set(["--dir", "--model", "--repo", "--concurrency"]);
+const VALUE_FLAGS = new Set(["--dir", "--model", "--provider", "--repo", "--concurrency"]);
 
 /** First non-flag token after the command, skipping the values of known value flags. */
 function requestArg(argv: string[]): string | undefined {
@@ -71,6 +71,15 @@ async function main(): Promise<number> {
   const cmd = argv[0];
   const dir = resolve(arg("--dir", argv) ?? process.cwd());
   const configBase = await loadConfig(dir);
+  // provider selection (OAE_PROVIDER / --provider); conventional default:
+  // the OpenCode adapter. Unknown values fail BEFORE any run state exists.
+  let providerSelection: string;
+  try {
+    providerSelection = normalizeProviderSelection(arg("--provider", argv) ?? process.env.OAE_PROVIDER);
+  } catch (e) {
+    console.error(`oae: ${(e as Error).message}`);
+    return 2;
+  }
 
   if (flag("--model", argv)) {
     const m = arg("--model", argv);
@@ -128,7 +137,7 @@ async function main(): Promise<number> {
         if (!flag("--quiet", argv)) {
           unsubscribe = store.onEvent(createProgressReporter({ colors: isTTY }));
         }
-        const { provider } = await createRuntime();
+        const { provider } = await createRuntime({ selection: providerSelection });
         const orch = new Orchestrator(provider, store, { config, dryRun: flag("--dry-run", argv) });
         const { state } = await orch.run(request);
         const report = await renderReport(store);
@@ -156,7 +165,7 @@ async function main(): Promise<number> {
       if (!lock.ok) { console.error(`oae: refusing to start: ${lock.reason}`); return 3; }
       try {
         const store = await Store.create(dir, runId, request);
-        const { provider } = await createRuntime();
+        const { provider } = await createRuntime({ selection: providerSelection });
         const orch = new Orchestrator(provider, store, { config, dryRun: true });
         await orch.run(request);
         console.log(JSON.stringify(store.state.tasks, null, 2));

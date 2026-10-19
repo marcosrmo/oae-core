@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod, appendFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod, appendFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -27,6 +27,10 @@ import { ProviderError, classifyProviderError, type ProviderErrorKind } from "..
 import { SessionLog } from "../src/sessions/writer.ts";
 import { createRuntime } from "../src/runtime.ts";
 import { OpenCodeProvider } from "../src/providers/opencode.ts";
+import { HttpTransport, TRANSPORT_CAPS, type ChatReply } from "../src/providers/http/transport.ts";
+import { FileToolSet, FILE_TOOL_LIMITS } from "../src/providers/http/filetools.ts";
+import { NVIDIAProvider } from "../src/providers/nvidia.ts";
+import { normalizeProviderSelection } from "../src/runtime.ts";
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
 import { listRunHistory } from "../src/history.ts";
@@ -1942,7 +1946,9 @@ test("provider errors: classifyProviderError maps auth/rateLimit/unavailable/pro
     [new Error("HTTP 401 unauthorized"), "auth"],
     [new Error("fetch failed: HTTP 429: rate limited"), "rateLimit"],
     [new Error("HTTP 402 budget exceeded"), "protocol"],
-    [new Error("HTTP 500: boom"), "protocol"],
+    // 5xx → unavailable (canonical HTTP table in contracts.ts; unified with
+    // the direct-provider transports in Onda 2)
+    [new Error("HTTP 500: boom"), "unavailable"],
     [new Error("connect ECONNREFUSED 127.0.0.1:4096"), "unavailable"],
     [new Error("weird failure"), "unknown"],
     ["bare string", "unknown"],
@@ -2173,5 +2179,788 @@ test("session rollout: torn tail is fenced on the next append — later records 
     assert.equal(lines[1]?.includes('"kind":"result"'), false, "no later record was glued into the torn line");
     assert.equal(JSON.parse(lines[2]!).kind, "result", "result record is an independent parseable line");
     assert.equal(JSON.parse(lines[3]!).kind, "interrupt");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Onda 2, etapa 1 — provider NVIDIA direto (transporte + runner + tools)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Recording fetch: configurable responses, zero network. */
+function recordingFetch(impl: (call: { url: string; init: RequestInit }) => Response | Promise<Response>): { calls: { url: string; init: RequestInit }[]; fetch: typeof fetch } {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : String((input as { url: string }).url);
+    calls.push({ url, init: init ?? {} });
+    return impl({ url, init: init ?? {} });
+  }) as unknown as typeof fetch;
+  return { calls, fetch: fetchImpl };
+}
+
+function sseEvent(obj: Record<string, unknown>): string {
+  return `data: ${JSON.stringify(obj)}\n\n`;
+}
+function contentEvent(text: string): string {
+  return sseEvent({ id: "chatcmpl-t", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+}
+function finishEvent(reason: string, usage?: Record<string, unknown>): string {
+  return sseEvent({
+    id: "chatcmpl-t",
+    choices: [{ index: 0, delta: {}, finish_reason: reason }],
+    ...(usage ? { usage } : {}),
+  });
+}
+const DONE_MARKER = "data: [DONE]\n\n";
+function sseResponseBody(parts: string[], opts: { chunkDelayMs?: number } = {}): Response {
+  const enc = new TextEncoder();
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        for (const p of parts) {
+          if (opts.chunkDelayMs) await sleep(opts.chunkDelayMs);
+          controller.enqueue(enc.encode(p));
+        }
+        controller.close();
+      } catch { /* aborted mid-stream in tests: consumer cancels */ }
+    },
+  });
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), { status, headers: { "content-type": "application/json" } });
+}
+const TKEY = "nvapi-unit-test-key-0123456789";
+const TPROVIDER = { provider: "nvidia-direct", baseUrl: "https://integrate.test/v1", apiKey: TKEY } as const;
+
+test("nvidia transport: streaming happy path accumulates content, finish reason and usage", async () => {
+  const { calls, fetch: f } = recordingFetch(() => sseResponseBody([
+    contentEvent("hello "), contentEvent("world"), contentEvent("!"),
+    finishEvent("stop", { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 2 } }),
+    DONE_MARKER,
+  ]));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "z-ai/glm-5.3-flash", messages: [{ role: "user", content: "hi" }], signal: AbortSignal.timeout(10_000) }) as ChatReply;
+  assert.equal(rep.content, "hello world!");
+  assert.equal(rep.finishReason, "stop");
+  assert.deepEqual(rep.usage, { input: 10, output: 5, reasoning: 0, cacheRead: 2, cacheWrite: 0 });
+  assert.match(calls[0]!.url, /\/chat\/completions$/);
+  const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>;
+  assert.equal(body.stream, true);
+  assert.deepEqual(body.stream_options, { include_usage: true });
+  assert.equal((calls[0]!.init.headers as Record<string, string>).authorization, `Bearer ${TKEY}`);
+});
+
+test("nvidia transport: [DONE] terminates the stream; usage absence stays absent", async () => {
+  const { fetch: f } = recordingFetch(() => sseResponseBody([contentEvent("x"), DONE_MARKER]));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.content, "x");
+  assert.equal(rep.usage, undefined);
+});
+
+test("nvidia transport: HTTP statuses classify through the canonical table (auth/rateLimit/unavailable/protocol)", async () => {
+  const cases: [number, ProviderErrorKind][] = [
+    [401, "auth"], [403, "auth"], [429, "rateLimit"], [500, "unavailable"],
+    [503, "unavailable"], [404, "protocol"], [400, "protocol"],
+  ];
+  for (const [status, kind] of cases) {
+    const { fetch: f } = recordingFetch(() => jsonResponse({ error: { message: "nope" } }, status));
+    const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+    await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`status ${status} must reject`); },
+      (e: unknown) => {
+        assert.ok(e instanceof ProviderError, `status ${status}`);
+        assert.equal((e as ProviderError).kind, kind, `status ${status}`);
+        assert.equal((e as ProviderError).httpStatus, status, `status ${status}`);
+        assert.doesNotMatch((e as ProviderError).message, /nvapi-/);
+        assert.match((e as ProviderError).message, RegExp(`HTTP ${status}`));
+      },
+    );
+  }
+});
+
+test("nvidia transport: malformed SSE line → protocol error (never silently swallowed)", async () => {
+  const { fetch: f } = recordingFetch(() => sseResponseBody(["data: {broken-json\n\n", DONE_MARKER]));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => { assert.ok(e instanceof ProviderError); assert.equal((e as ProviderError).kind, "protocol"); },
+  );
+});
+
+test("nvidia transport: malformed non-streaming JSON body → protocol error", async () => {
+  const { fetch: f } = recordingFetch(() => new Response("not-json{{{", { status: 200, headers: { "content-type": "application/json" } }));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => { assert.equal((e as ProviderError).kind, "protocol"); },
+  );
+});
+
+test("nvidia transport: network failure (ENOTFOUND) → unavailable", async () => {
+  const { fetch: f } = recordingFetch(() => { throw new Error("getaddrinfo ENOTFOUND integrate.test"); });
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "unavailable");
+      assert.match((e as ProviderError).message, /ENOTFOUND/);
+    },
+  );
+});
+
+test("nvidia transport: abort mid-stream → honest abort error (runner maps it to 'interrupted')", async () => {
+  const ac = new AbortController();
+  // three slow chunks keep the stream OPEN while the abort fires mid-read
+  const { fetch: f } = recordingFetch(() => sseResponseBody([
+    contentEvent("partial "), contentEvent("more "), contentEvent("even more "),
+  ], { chunkDelayMs: 80 }));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  const p = t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: ac.signal }).then(
+    () => { throw new Error("must not complete"); },
+    (e: unknown) => e,
+  );
+  setTimeout(() => ac.abort(), 120);
+  const e = (await p) as ProviderError;
+  assert.ok(e instanceof ProviderError);
+  assert.match(e.message, /aborted/i);
+});
+
+test("nvidia transport: a 400 mentioning 'stream' triggers one non-streaming retry (sticky)", async () => {
+  let n = 0;
+  const { calls, fetch: f } = recordingFetch(() => {
+    n++;
+    if (n === 1) return jsonResponse({ error: { message: "stream_options is not supported by this gateway" } }, 400);
+    return jsonResponse({
+      choices: [{ index: 0, message: { content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 3, completion_tokens: 2 },
+    });
+  });
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.content, "ok");
+  assert.equal(calls.length, 2);
+  const body2 = JSON.parse(String(calls[1]!.init.body)) as Record<string, unknown>;
+  assert.equal(body2.stream, false);
+  assert.equal(body2.stream_options, undefined);
+  // sticky: the next round of the SAME session stays non-streaming
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u2" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(calls.length, 3);
+  const body3 = JSON.parse(String(calls[2]!.init.body)) as Record<string, unknown>;
+  assert.equal(body3.stream, false);
+});
+
+test("nvidia provider: missing OAE_NVIDIA_API_KEY → clear configuration error (no secret material)", () => {
+  const prev = process.env.OAE_NVIDIA_API_KEY;
+  delete process.env.OAE_NVIDIA_API_KEY;
+  try {
+    assert.throws(() => NVIDIAProvider.start(), (e: unknown) => {
+      const m = String((e as Error).message);
+      assert.match(m, /OAE_NVIDIA_API_KEY is not set/);
+      assert.match(m, /configuration error/);
+      assert.doesNotMatch(m, /nvapi-/);
+      return true;
+    });
+  } finally {
+    if (prev !== undefined) process.env.OAE_NVIDIA_API_KEY = prev;
+  }
+});
+
+test("nvidia runner: coder tool loop writes/reads files inside the root and completes (usage aggregated)", async () => {
+  const dir = await makeProject();
+  try {
+    let n = 0;
+    const { calls, fetch: f } = recordingFetch(() => {
+      n++;
+      if (n === 1) {
+        return sseResponseBody([
+          sseEvent({
+            id: "chatcmpl-t",
+            choices: [{
+              index: 0,
+              delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "write_file", arguments: '{"pa' } }] },
+              finish_reason: null,
+            }],
+          }),
+          sseEvent({
+            id: "chatcmpl-t",
+            choices: [{
+              index: 0,
+              delta: { tool_calls: [{ index: 0, function: { arguments: "th\":\"a.txt\",\"content\":\"hola outils\"}" } }] },
+              finish_reason: null,
+            }],
+          }),
+          finishEvent("tool_calls", { prompt_tokens: 12, completion_tokens: 9 }),
+          DONE_MARKER,
+        ]);
+      }
+      return sseResponseBody([
+        contentEvent("RESULT: files changed: a.txt\nIMPEDIMENT: none"),
+        finishEvent("stop", { prompt_tokens: 30, completion_tokens: 20 }),
+        DONE_MARKER,
+      ]);
+    });
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    assert.equal(provider.id, "nvidia-direct");
+    const runner = await provider.createSession({
+      directory: dir, title: "OAE coder task-1", agent: "build",
+      model: { providerID: "nvidia", id: "z-ai/glm-5.3-flash" },
+      tools: true, promptText: "create a.txt with the text",
+    });
+    assert.equal(runner.runtime, "nvidia-direct");
+    assert.ok(runner.sessionId.startsWith("nvidia-direct-"));
+    const res = await runner.awaitCompletion(15_000);
+    assert.equal(res.outcome, "completed", res.output);
+    assert.match(res.output, /RESULT: files changed: a\.txt/);
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "hola outils");
+    // request bodies: tools only on the coder; tool result rounded back
+    const body1 = JSON.parse(String(calls[0]!.init.body)) as { model?: string; tools?: { function: { name: string } }[]; messages: unknown[] };
+    assert.deepEqual((body1.tools ?? []).map((x) => x.function.name).sort(), ["list_dir", "read_file", "write_file"]);
+    assert.equal(body1.model, "z-ai/glm-5.3-flash");
+    const body2 = JSON.parse(String(calls[1]!.init.body)) as { messages: { role: string; content: string }[] };
+    assert.ok(body2.messages.some((m) => m.role === "tool" && m.content.includes("written ")), "tool result was fed back");
+    const u = await runner.usage();
+    assert.ok(u, "usage aggregated across rounds");
+    assert.equal(u!.input, 42);
+    assert.equal(u!.output, 29);
+    assert.equal(u!.cost, null);
+    // completed rounds are reflected in the bounded transcript with roles
+    const tail = await runner.transcriptTail(8);
+    assert.match(tail, /\[assistant\]/);
+    assert.match(tail, /\[tool\(call_1\)\]/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner: model propagation identical for planner, coder and reviewer; tools only for the coder", async () => {
+  const dir = await makeProject();
+  try {
+    const bodies: Array<Record<string, unknown>> = [];
+    const { fetch: f } = recordingFetch((c) => {
+      bodies.push(JSON.parse(String(c.init.body)) as Record<string, unknown>);
+      return jsonResponse({
+        choices: [{ index: 0, message: { content: "plain reply" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      });
+    });
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const agents = ["plan", "build", "oae-reviewer"];
+    const runners = [];
+    for (const agent of agents) {
+      runners.push(await provider.createSession({
+        directory: dir, title: `t-${agent}`, agent,
+        model: { providerID: "nvidia", id: "z-ai/glm-5.3-flash" },
+        tools: agent === "build", promptText: `role ${agent}`,
+      }));
+    }
+    const results = await Promise.all(runners.map((r) => r.awaitCompletion(15_000)));
+    for (const r of results) assert.equal(r.outcome, "completed");
+    assert.deepEqual(bodies.map((b) => b.model), ["z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash"]);
+    assert.equal(bodies[0]!.tools === undefined, true, "planner: no tools");
+    assert.equal(bodies[1]!.tools !== undefined, true, "coder: tools present");
+    assert.equal(bodies[2]!.tools === undefined, true, "reviewer: no tools");
+    assert.ok((bodies[1]!.messages as { role: string; content?: string }[]).some((m) => m.role === "system" && String(m.content ?? "").includes("coder")));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner: dispatch auth failure rejects createSession (ProviderError auth, no key echoed)", async () => {
+  const dir = await makeProject();
+  try {
+    const { fetch: f } = recordingFetch(() => jsonResponse({ error: { message: "invalid key" } }, 401));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    await provider.createSession({
+      directory: dir, title: "t", agent: "build",
+      model: { providerID: "nvidia", id: "z-ai/glm-5.3-flash" }, promptText: "x",
+    }).then(
+      () => { throw new Error("must reject"); },
+      (e: unknown) => {
+        assert.ok(e instanceof ProviderError);
+        assert.equal((e as ProviderError).kind, "auth");
+        assert.match((e as ProviderError).message, /HTTP 401/);
+        assert.doesNotMatch((e as ProviderError).message, /nvapi-/);
+      },
+    );
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner: interrupt() mid-stream settles 'interrupted' (never silent success), transcriptTail safe", async () => {
+  const dir = await makeProject();
+  try {
+    let n = 0;
+    const { fetch: f } = recordingFetch(() => {
+      n++;
+      if (n === 1) return sseResponseBody([contentEvent("thinking "), contentEvent("more "), contentEvent("kept going")], { chunkDelayMs: 120 });
+      void n; return sseResponseBody([]);
+    });
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: false, promptText: "long work",
+    });
+    setTimeout(() => { void runner.interrupt(); }, 160);
+    const res = await runner.awaitCompletion(30_000);
+    assert.equal(res.outcome, "interrupted");
+    assert.notEqual(res.output, "completed", "no fake success on interrupt");
+    // the transcript is safe mid-interruption and truthfully reflects that
+    // no assistant round completed (partial stream content is not an attempt)
+    const tail = await runner.transcriptTail(10);
+    assert.match(tail, /\[user\]/);
+    assert.match(tail, /\[system\]/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner: finished-but-empty stream stays honestly 'completed' with empty output", async () => {
+  const dir = await makeProject();
+  try {
+    const { fetch: f } = recordingFetch(() => sseResponseBody([finishEvent("stop"), DONE_MARKER]));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "plan", model: null, tools: false, promptText: "say nothing",
+    });
+    const res = await runner.awaitCompletion(10_000);
+    assert.equal(res.outcome, "completed");
+    assert.equal(res.output, "");
+    assert.equal(await runner.usage(), null, "no usage reported → null (tokensUnknown preserved)");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("runtime: nvidia-direct selection never opens the OpenCode path; unknown selection fails honestly", async () => {
+  const prev = process.env.OAE_NVIDIA_API_KEY;
+  process.env.OAE_NVIDIA_API_KEY = "nvapi-runtime-test-0001";
+  try {
+    const rt = await createRuntime({ selection: "nvidia-direct" });
+    assert.equal(rt.provider.id, "nvidia-direct");
+    assert.equal(rt.endpoint?.url, "https://integrate.api.nvidia.com/v1");
+    // no OpenCode endpoint is materialized for the direct selection
+    assert.doesNotMatch(rt.endpoint?.url ?? "", /127\.0\.0\.1/);
+  } finally {
+    if (prev === undefined) delete process.env.OAE_NVIDIA_API_KEY;
+    else process.env.OAE_NVIDIA_API_KEY = prev;
+  }
+  assert.equal(normalizeProviderSelection(undefined), "opencode");
+  assert.equal(normalizeProviderSelection("nvidia"), "nvidia-direct");
+  assert.equal(normalizeProviderSelection("opencode"), "opencode");
+  assert.throws(() => normalizeProviderSelection("openrouter"), /unknown provider selection/);
+});
+
+// ── FileToolSet isolation (root confinement, strict schemas, caps) ─────────
+
+test("filetools: read/write/list inside the root succeed with caps", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    const w = await ts.execute("write_file", JSON.stringify({ path: "src/nested/mod.ts", content: "ok" }));
+    assert.match(w, /written 2 bytes to src\/nested\/mod\.ts/);
+    assert.equal(await readFile(join(dir, "src", "nested", "mod.ts"), "utf8"), "ok");
+    const r = await ts.execute("read_file", JSON.stringify({ path: "src/nested/mod.ts" }));
+    assert.equal(r, "ok");
+    const l = await ts.execute("list_dir", JSON.stringify({}));
+    assert.match(l, /src\//);
+    // read cap with truncation marker
+    const big = "x".repeat(FILE_TOOL_LIMITS.readMaxChars + 500);
+    await ts.execute("write_file", JSON.stringify({ path: "big.txt", content: big }));
+    const r2 = await ts.execute("read_file", JSON.stringify({ path: "big.txt" }));
+    assert.strictEqual(r2.length > FILE_TOOL_LIMITS.readMaxChars && r2.length < big.length + 300, true);
+    assert.match(r2, /\[truncated: file has /);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools: traversal/absolute/backslash/drive/tilde rejections stay inside the root", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    const rejects: [string, string, RegExp][] = [
+      ["read_file", "../outside.txt", /\.\./],
+      ["read_file", "..", /\.\./],
+      ["read_file", "/etc/hosts", /absolute/],
+      ["read_file", "C:\\Windows\\system32", /absolute/],
+      ["read_file", "~/.ssh/id_rsa", /'~'/],
+      ["read_file", "\u0000evil", /NUL/],
+      ["write_file", "../outside.txt", /\.\./],
+      ["write_file", "/tmp/pwned", /absolute/],
+    ];
+    for (const [tool, path, re] of rejects) {
+      const args = tool === "write_file" ? JSON.stringify({ path, content: "x" }) : JSON.stringify({ path });
+      const out = await ts.execute(tool, args);
+      assert.match(out, /ERROR: /, `${tool} ${path}`);
+      assert.match(out, re, `${tool} ${path}`);
+    }
+    // encoded traversal is just a weird literal filename: it can only name a
+    // non-existent file INSIDE the root — never an escape
+    const enc = await ts.execute("read_file", JSON.stringify({ path: "%2e%2e/config" }));
+    assert.match(enc, /no such path/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools: symlink escapes are refused for read and write", async () => {
+  const dir = await makeProject();
+  try {
+    const outside = join(await mkdtemp(join(tmpdir(), "oae-out-")), "outside.txt");
+    await writeFile(outside, "top secret", "utf8");
+    await symlink(outside, join(dir, "lure.txt"));
+    const ts = new FileToolSet(dir);
+    const r = await ts.execute("read_file", JSON.stringify({ path: "lure.txt" }));
+    assert.match(r, /refusing to follow a symlink/);
+    const w = await ts.execute("write_file", JSON.stringify({ path: "lure.txt", content: "overwritten?" }));
+    assert.match(w, /target is a symlink/);
+    assert.equal(await readFile(outside, "utf8"), "top secret", "outside file untouched");
+    // directory symlink escape on write
+    const outsideDir = join(await mkdtemp(join(tmpdir(), "oae-outd-")));
+    await symlink(outsideDir, join(dir, "lure.dir"));
+    const w2 = await ts.execute("write_file", JSON.stringify({ path: "lure.dir/new.txt", content: "x" }));
+    assert.match(w2, /escapes the project root/);
+    const listed = await readdir(outsideDir);
+    assert.equal(listed.length, 0, "no file created outside");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("filetools: .oae/.opencode are model-read-only; strict schemas reject bad arguments", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    // read-only guard
+    const w = await ts.execute("write_file", JSON.stringify({ path: ".oae/state.json", content: "{}" }));
+    assert.match(w, /read-only for the model/);
+    const w2 = await ts.execute("write_file", JSON.stringify({ path: ".opencode/agent.json", content: "{}" }));
+    assert.match(w2, /read-only for the model/);
+    // strict argument schemas
+    const badJson = await ts.execute("read_file", "{oops");
+    assert.match(badJson, /not valid JSON/);
+    const extra = await ts.execute("read_file", JSON.stringify({ path: "a", mode: "x" }));
+    assert.match(extra, /unknown field "mode"/);
+    const wrongType = await ts.execute("write_file", JSON.stringify({ path: "a", content: 42 }));
+    assert.match(wrongType, /field "content" must be a string/);
+    const unknownTool = await ts.execute("shell", JSON.stringify({ cmd: "ls" }));
+    assert.match(unknownTool, /unknown tool/);
+    // write size cap
+    const tooBig = "y".repeat(FILE_TOOL_LIMITS.writeMaxChars + 10);
+    const cap = await ts.execute("write_file", JSON.stringify({ path: "big.txt", content: tooBig }));
+    assert.match(cap, /exceeds the .* cap/);
+    // list_dir cap
+    await mkdir(join(dir, "flood"), { recursive: true });
+    for (let i = 0; i < FILE_TOOL_LIMITS.listMaxEntries + 5; i++) {
+      await writeFile(join(dir, "flood", `f${i}.txt`), "x", "utf8");
+    }
+    const l = await ts.execute("list_dir", JSON.stringify({ path: "flood" }));
+    assert.match(l, /\[5 more entries hidden/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("redact: nvapi- keys are masked wherever they could appear (defense in depth)", () => {
+  assert.equal(redact("Bearer nvapi-unit-test-key-0123456789"), "Bearer [redacted]");
+  assert.equal(redact("configured key nvapi-abcdefgh123456789 in config"), "configured key [redacted] in config");
+  assert.doesNotMatch(redact("Bearer nvapi-unit-test-key-0123456789"), /nvapi-unit/);
+});
+
+// ── Auditoria Onda 2/Etapa 1: correções F1..F7, F9 ──────────────────────────
+
+/** Never-resolving tool executor: deterministic stand-in for a tool stuck on
+ * non-cancellable OS I/O (e.g. open() on a FIFO) — no FIFOs, no hung procs. */
+const stuckToolExecutor = {
+  execute: (): Promise<string> => new Promise<string>(() => {}),
+};
+
+function buildToolCallReply(tool: { name: string; args: string }): string {
+  return [
+    sseEvent({ id: "chatcmpl-t", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", function: { name: tool.name, arguments: tool.args } }] }, finish_reason: null }] }),
+    sseEvent({ id: "chatcmpl-t", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+    DONE_MARKER,
+  ].join("");
+}
+
+test("nvidia runner F1: interrupt() settles 'interrupted' in finite time while a tool is blocked", async () => {
+  const dir = await makeProject();
+  try {
+    const { fetch: f } = recordingFetch(() => sseResponseBody([
+      buildToolCallReply({ name: "read_file", args: '{"path":"whatever.txt"}' }),
+    ]));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "blocked tool", toolExecutor: stuckToolExecutor,
+    });
+    setTimeout(() => { void runner.interrupt(); }, 120);
+    const started = Date.now();
+    const res = await runner.awaitCompletion(30_000);
+    const elapsed = Date.now() - started;
+    assert.equal(res.outcome, "interrupted");
+    assert.ok(elapsed < 5_000, `settle em tempo finito (elapsed=${elapsed}ms)`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner F1: the awaitCompletion deadline alone ends the wait while a tool is blocked", async () => {
+  const dir = await makeProject();
+  try {
+    const { fetch: f } = recordingFetch(() => sseResponseBody([
+      buildToolCallReply({ name: "read_file", args: '{"path":"whatever.txt"}' }),
+    ]));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "deadline test", toolExecutor: stuckToolExecutor,
+    });
+    const started = Date.now();
+    const res = await runner.awaitCompletion(700);
+    const elapsed = Date.now() - started;
+    assert.equal(res.outcome, "interrupted");
+    assert.ok(elapsed < 5_000, `deadline interrompe de fato (elapsed=${elapsed}ms)`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner F1: a late tool resolution cannot restart the pump, re-settle or leak rejections", async () => {
+  const dir = await makeProject();
+  try {
+    let resolveTool: ((v: string) => void) | null = null;
+    const lateExecutor = {
+      execute: (): Promise<string> => new Promise<string>((res) => { resolveTool = res; }),
+    };
+    const { fetch: f } = recordingFetch(() => sseResponseBody([
+      buildToolCallReply({ name: "write_file", args: '{"path":"a.txt","content":"x"}' }),
+    ]));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "late resolution", toolExecutor: lateExecutor,
+    });
+    setTimeout(() => { void runner.interrupt(); }, 150);
+    const res = await runner.awaitCompletion(30_000);
+    assert.equal(res.outcome, "interrupted");
+    const signalsAtSettle = res.signals.length;
+    const rejections: unknown[] = [];
+    const onUnhandled = (r: unknown): void => { rejections.push(r); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await sleep(300);                       // the tool finally "completes"
+      resolveTool!("tool result arrived after settlement");
+      await sleep(150);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    assert.equal(rejections.length, 0, "no unhandled rejection from the abandoned tool");
+    const res2 = await runner.awaitCompletion(1_000);
+    assert.equal(res2, res, "settlement stays exactly the same object");
+    assert.equal(res2.outcome, "interrupted", "late resolution did not flip the terminal state");
+    assert.equal(res2.signals.length, signalsAtSettle, "no duplicated/late signals");
+    await assert.rejects(() => runner.prompt("anything"), /already finished/, "session is terminal: no pump restart");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F2: bounded read reports the EXACT char count for files over the cap (1-byte chars)", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    const n = FILE_TOOL_LIMITS.readMaxChars * 2 + 137;
+    await ts.execute("write_file", JSON.stringify({ path: "big.txt", content: "x".repeat(n) }));
+    const r = await ts.execute("read_file", JSON.stringify({ path: "big.txt" }));
+    assert.match(r, new RegExp(`…\\[truncated: file has ${n} chars, showing first 48000\\]`));
+    assert.equal(r.slice(0, FILE_TOOL_LIMITS.readMaxChars), "x".repeat(FILE_TOOL_LIMITS.readMaxChars));
+    assert.ok(r.length < n + 200, "bounded result size");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F2: bounded read counts multi-byte chars exactly (2-byte path, no truncation-by-bytes)", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    const total = 60_000; // 2-byte chars → 120k bytes < capBytes: prefix covers all, count exact
+    await ts.execute("write_file", JSON.stringify({ path: "uni.txt", content: "é".repeat(total) }));
+    const r = await ts.execute("read_file", JSON.stringify({ path: "uni.txt" }));
+    assert.match(r, /…\[truncated: file has 60000 chars, showing first 48000\]/);
+    const head = r.slice(0, FILE_TOOL_LIMITS.readMaxChars);
+    assert.equal(head, "é".repeat(FILE_TOOL_LIMITS.readMaxChars), "no corrupt mid-codepoint char in the head");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F2: list_dir keeps exact hidden count and alphabetical-first subset for oversized dirs", async () => {
+  const dir = await makeProject();
+  try {
+    const extra = 7;
+    for (let i = 0; i < FILE_TOOL_LIMITS.listMaxEntries + extra; i++) {
+      await writeFile(join(dir, `f${String(i).padStart(3, "0")}.txt`), "x", "utf8");
+    }
+    const ts = new FileToolSet(dir);
+    const r = await ts.execute("list_dir", JSON.stringify({ path: "." }));
+    const lines = r.split("\n");
+    const first = lines.findIndex((l) => l.startsWith("f"));
+    assert.equal(lines[first], "f000.txt", "alphabetically-first entry shown");
+    assert.equal(lines[first + FILE_TOOL_LIMITS.listMaxEntries - 1], `f${String(FILE_TOOL_LIMITS.listMaxEntries - 1).padStart(3, "0")}.txt`, "shown slice holds the 400 smallest names");
+    assert.match(r, /…\[7 more entries hidden \(cap 400\)\]/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia transport F3: tool-call index flood ends in a controlled protocol error", async () => {
+  const parts: string[] = [];
+  for (let i = 0; i < TRANSPORT_CAPS.toolSlotsMax + 8; i++) {
+    parts.push(sseEvent({ id: "t", choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `c${i}`, function: { name: "t", arguments: "{}" } }] }, finish_reason: null }] }));
+  }
+  const { fetch: f } = recordingFetch(() => sseResponseBody(parts));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "protocol");
+      assert.match((e as ProviderError).message, /tool-call indexes/);
+    },
+  );
+});
+
+test("nvidia transport F3: valid streams staying within the slot cap keep working", async () => {
+  const parts: string[] = [];
+  const slots = TRANSPORT_CAPS.toolSlotsMax;
+  for (let i = 0; i < slots; i++) {
+    parts.push(sseEvent({ id: "t", choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `c${i}`, function: { name: "t", arguments: '{"k":' + i + "}" } }] }, finish_reason: null }] }));
+  }
+  parts.push(sseEvent({ id: "t", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }), DONE_MARKER);
+  const { fetch: f } = recordingFetch(() => sseResponseBody(parts));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.toolCalls?.length, slots);
+});
+
+test("nvidia transport F4: a 400 without a 'stream' hint carries the real gateway diagnostic", async () => {
+  const { fetch: f } = recordingFetch(() => jsonResponse({ error: { message: "model not found in this endpoint" } }, 400));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "protocol");
+      assert.match((e as ProviderError).message, /model not found in this endpoint/);
+      assert.doesNotMatch((e as ProviderError).message, /unreadable error body/);
+    },
+  );
+});
+
+test("nvidia transport F5: [DONE] and final delta without a trailing newline are honored at EOF", async () => {
+  // case 1: "[DONE]" como ÚLTIMA linha sem "\n" final
+  const { fetch: f1 } = recordingFetch(() => sseResponseBody([contentEvent("tail "), "data: [DONE]"]));
+  const t1 = new HttpTransport({ ...TPROVIDER, fetchImpl: f1 });
+  const r1 = await t1.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(r1.content, "tail ");
+
+  // case 2: último evento de delta/finish sem "\n" final
+  const lastEvent = sseEvent({ id: "t", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }).replace(/\n+$/, "");
+  const { fetch: f2 } = recordingFetch(() => sseResponseBody([contentEvent("body"), lastEvent]));
+  const t2 = new HttpTransport({ ...TPROVIDER, fetchImpl: f2 });
+  const r2 = await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(r2.content, "body");
+  assert.equal(r2.finishReason, "stop");
+});
+
+test("nvidia runner F6: prompts accepted while running are reported as dropped on terminal states", async () => {
+  const dir = await makeProject();
+  try {
+    let n = 0;
+    const { fetch: f } = recordingFetch(() => sseResponseBody([buildToolCallReply({ name: "write_file", args: `{"path":"r${n++}.txt","content":"x"}` })]));
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "start", toolExecutor: {
+        execute: async () => "written 1 bytes",
+      },
+      maxToolRounds: 1,
+    });
+    // accepted while the chain is running (round 2 in flight); the chain then
+    // hits the tool-call budget → terminal state that must NOT drop it silently
+    await runner.prompt("follow-up that cannot be served");
+    const res = await runner.awaitCompletion(10_000);
+    assert.equal(res.outcome, "failed");
+    assert.match(res.output, /tool-call round budget \(1\) exhausted/);
+    assert.match(res.output, /1 queued follow-up prompt\(s\) were dropped by this terminal session state/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("nvidia runner F9: tool arguments are redacted in signals and in the transcript tail", async () => {
+  const dir = await makeProject();
+  try {
+    const secret = "nvapi-abcdefghijklmnop123";
+    let n = 0;
+    const { fetch: f } = recordingFetch(() => {
+      n++;
+      if (n === 1) {
+        return sseResponseBody([
+          sseEvent({ id: "t", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", function: { name: "write_file", arguments: `{"path":"a.txt","content":"key ${secret} leaked?"}` } }] }, finish_reason: null }] }),
+          sseEvent({ id: "t", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+          DONE_MARKER,
+        ]);
+      }
+      return sseResponseBody([contentEvent("done"), finishEvent("stop"), DONE_MARKER]);
+    });
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "x", toolExecutor: { execute: async () => "written ok" },
+    });
+    const res = await runner.awaitCompletion(10_000);
+    assert.equal(res.outcome, "completed");
+    const toolSignal = res.signals.find((s) => s.kind === "tool");
+    assert.ok(toolSignal, "tool signal exists");
+    assert.doesNotMatch(toolSignal!.detail, RegExp(secret));
+    assert.match(toolSignal!.detail, /\[redacted\]/);
+    const tail = await runner.transcriptTail(20);
+    assert.doesNotMatch(tail, RegExp(secret));
+    assert.match(tail, /\[redacted\]/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F7: a symlinked intermediate NEVER triggers mkdir outside the root", async () => {
+  const dir = await makeProject();
+  const outside = join(await mkdtemp(join(tmpdir(), "oae-lure-")));
+  try {
+    await symlink(outside, join(dir, "lure.dir"));
+    const ts = new FileToolSet(dir);
+    const w = await ts.execute("write_file", JSON.stringify({ path: "lure.dir/sub/deep/new.txt", content: "x" }));
+    assert.match(w, /escapes the project root/);
+    assert.equal((await readdir(outside)).length, 0, "nothing was created outside the root");
+  } finally {
+    await rm(join(dir, "lure.dir"), { force: true });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Auditoria final: A5 — ordem redact ANTES de truncate ────────────────────
+
+test("nvidia runner A5: a secret straddling the truncation boundary leaves no visible prefix", async () => {
+  const dir = await makeProject();
+  try {
+    const KEY = "nvapi-abcdefghijklmnop";
+    // old order redact(truncate(...)) leaked "nvapi-ab" here: with the cut at
+    // 120 chars only "ab" (2 chars < the regex's 8-char minimum) stayed
+    // visible, so redaction could never fire. truncation boundaries are exact:
+    // 500-492 = 8 and 120-112 = 8 visible chars on both surfaces. A non-word
+    // char precedes the key so redact()'s \b boundary matches the full token.
+    const straddleContent = "x".repeat(491) + " " + KEY; // key starts @492: cut @500 → "nvapi-ab" visible
+    const straddleArgs = '{"path":"a.txt","content":"' + "y".repeat(84) + " " + KEY + '"}'; // key starts @112: cut @120 → "nvapi-ab" visible
+    let n = 0;
+    const { fetch: f } = recordingFetch(() => {
+      n++;
+      if (n === 1) {
+        return sseResponseBody([buildToolCallReply({ name: "write_file", args: straddleArgs })]);
+      }
+      return sseResponseBody([contentEvent(straddleContent), finishEvent("stop"), DONE_MARKER]);
+    });
+    const provider = NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: f });
+    const runner = await provider.createSession({
+      directory: dir, title: "t", agent: "build", model: null,
+      tools: true, promptText: "boundary test", toolExecutor: { execute: async () => "written ok" },
+    });
+    const res = await runner.awaitCompletion(10_000);
+    assert.equal(res.outcome, "completed");
+    // transcript tail: content boundary (500) AND tool-args boundary (120).
+    // the redaction marker may itself be cut by the boundary; /n {2}/ partial
+    // "[redact" is still proof redaction ran in full before truncation.
+    const tail = await runner.transcriptTail(30);
+    assert.doesNotMatch(tail, /nvapi-/, "no secret prefix visible in the tail");
+    assert.match(tail, /\[redact/, "partial redaction marker proves redact ran pre-truncate");
+    // tool signals: args boundary at 160
+    const toolSignals = res.signals.filter((s) => s.kind === "tool");
+    assert.ok(toolSignals.length >= 1);
+    for (const s of toolSignals) {
+      assert.doesNotMatch(s.detail, /nvapi-/);
+      assert.match(s.detail, /\[redact/);
+    }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

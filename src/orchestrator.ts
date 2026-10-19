@@ -300,6 +300,9 @@ export class Orchestrator {
       title: `OAE ${kind} ${task.id}`,
       agent,
       model: cfg.model,
+      // direct providers carry no built-in agent tooling: only the coder gets
+      // the confined local file tools; planner/reviewer stay textual
+      tools: kind === "coder",
       promptText: prompt,
     });
     return { runner, prompt };
