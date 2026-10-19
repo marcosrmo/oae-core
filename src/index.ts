@@ -20,7 +20,7 @@ import { sleep } from "./util.ts";
 import { loadConfig, defaultConfig } from "./config.ts";
 import { Store } from "./store.ts";
 import { Orchestrator, type RunOptions } from "./orchestrator.ts";
-import { connect } from "./opencode.ts";
+import { createRuntime } from "./runtime.ts";
 import { renderReport } from "./report.ts";
 import { inspectGit } from "./git.ts";
 import { checkRemote, publish } from "./publish.ts";
@@ -128,8 +128,8 @@ async function main(): Promise<number> {
         if (!flag("--quiet", argv)) {
           unsubscribe = store.onEvent(createProgressReporter({ colors: isTTY }));
         }
-        const { client } = await connect();
-        const orch = new Orchestrator(client, store, { config, dryRun: flag("--dry-run", argv) });
+        const { provider } = await createRuntime();
+        const orch = new Orchestrator(provider, store, { config, dryRun: flag("--dry-run", argv) });
         const { state } = await orch.run(request);
         const report = await renderReport(store);
         await writeFile(join(dir, ".oae", "REPORT.md"), report, "utf8");
@@ -156,8 +156,8 @@ async function main(): Promise<number> {
       if (!lock.ok) { console.error(`oae: refusing to start: ${lock.reason}`); return 3; }
       try {
         const store = await Store.create(dir, runId, request);
-        const { client } = await connect();
-        const orch = new Orchestrator(client, store, { config, dryRun: true });
+        const { provider } = await createRuntime();
+        const orch = new Orchestrator(provider, store, { config, dryRun: true });
         await orch.run(request);
         console.log(JSON.stringify(store.state.tasks, null, 2));
         return 0;

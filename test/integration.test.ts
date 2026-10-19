@@ -12,15 +12,15 @@ import { join } from "node:path";
 import { Store } from "../src/store.ts";
 import { Orchestrator } from "../src/orchestrator.ts";
 import { loadConfig, type OaeConfig } from "../src/config.ts";
-import { connect } from "../src/opencode.ts";
+import { createRuntime } from "../src/runtime.ts";
 import { installIntoProject } from "../src/setup.ts";
 import type { Plan } from "../src/planner.ts";
 
 async function serviceAvailable(): Promise<boolean> {
   try {
-    const { client } = await connect();
-    const info = await client.server.info();
-    return Boolean(info);
+    const { provider } = await createRuntime();
+    const hc = await provider.healthCheck?.();
+    return Boolean(hc?.ok ?? provider);
   } catch {
     return false;
   }
@@ -71,8 +71,8 @@ test("integration: real OpenCode session implements and reviews a change", { tim
       }],
       decisions: [],
     };
-    const { client } = await connect();
-    const orch = new Orchestrator(client, store, { config, plan, sweepIntervalMs: 60_000 });
+    const { provider } = await createRuntime();
+    const orch = new Orchestrator(provider, store, { config, plan, sweepIntervalMs: 60_000 });
     const { state } = await orch.run("add sub() to index.js");
     const task = state.tasks[0];
     // the code must actually exist — proof beyond session claims

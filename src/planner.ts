@@ -7,7 +7,7 @@
 import { join } from "node:path";
 import { readJson } from "./util.ts";
 import type { OaeConfig } from "./config.ts";
-import type { Client } from "./opencode.ts";
+import type { Provider } from "./providers/contract.ts";
 
 export interface PlannedTask {
   id: string;
@@ -65,13 +65,13 @@ export function defaultValidators(dir: string, stack: string): { name: string; c
 }
 
 async function planWithModel(
-  client: Client,
+  provider: Provider,
   config: OaeConfig,
   request: string,
   stack: string,
   validators: { name: string; cmd: string; args: string[] }[],
 ): Promise<Plan | undefined> {
-  const runner = await import("./opencode.ts").then((m) => m.OpenCodeRunner.start(client, {
+  const runner = await provider.createSession({
     directory: config.projectDir,
     title: "OAE plan",
     agent: config.plannerAgent,
@@ -88,7 +88,7 @@ async function planWithModel(
       "Rules: max 5 tasks; each task implementable in one session; instructions must reference concrete files; acceptance criteria must be checkable commands or verifiable conditions; never invent financial/legal/commercial rules (mark such hypotheses kind='business-hypothesis').",
       "This is the planning step of one autonomous run: do not start other runs and do not invoke the OAE CLI; respond with the JSON only.",
     ].join("\n"),
-  }));
+  });
   const result = await runner.awaitCompletion(5 * 60_000);
   const m = result.output.match(/\{[\s\S]*\}/);
   if (!m) return undefined;
@@ -144,14 +144,14 @@ function fallbackPlan(request: string, stack: string, validators: { name: string
 export const PLANNER_MODEL_MIN_REQUEST = 200;
 
 export async function makePlan(
-  client: Client | null,
+  provider: Provider | null,
   config: OaeConfig,
   request: string,
 ): Promise<Plan> {
   const stack = await detectStack(config.projectDir);
   const validators = config.validators.length > 0 ? config.validators : defaultValidators(config.projectDir, stack);
-  if (client && request.trim().length >= PLANNER_MODEL_MIN_REQUEST) {
-    const p = await planWithModel(client, config, request, stack, validators).catch(() => undefined);
+  if (provider && request.trim().length >= PLANNER_MODEL_MIN_REQUEST) {
+    const p = await planWithModel(provider, config, request, stack, validators).catch(() => undefined);
     if (p) return p;
   }
   return fallbackPlan(request, stack, validators);

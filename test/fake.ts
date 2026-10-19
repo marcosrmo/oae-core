@@ -1,8 +1,10 @@
 /**
  * Deterministic fake agents for unit tests. Same AgentRunner contract as
- * OpenCodeRunner; no provider calls, fully reproducible.
+ * OpenCodeRunner; no provider calls, fully reproducible. Deliberately
+ * implements the CONTRACT (src/contracts.ts), proving the seam is
+ * adapter-independent.
  */
-import type { AgentRunner, AgentRunResult, ProgressSignal } from "../src/opencode.ts";
+import type { AgentRunner, AgentRunResult, ProgressSignal } from "../src/contracts.ts";
 import { nowISO } from "../src/util.ts";
 
 export type FakeBehavior =
@@ -12,6 +14,7 @@ export type FakeBehavior =
   ;
 
 export class FakeRunner implements AgentRunner {
+  readonly runtime = "fake";
   readonly sessionId: string;
   behavior: FakeBehavior;
   prompts: string[] = [];

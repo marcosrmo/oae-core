@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -20,7 +20,13 @@ import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
 import { createProgressReporter, progressFrame, progressLine, redact } from "../src/progress.ts";
-import { OpenCodeRunner, type Client, type SessionUsage, type AgentRunner, type AgentRunResult, type ProgressSignal } from "../src/opencode.ts";
+import { OpenCodeRunner, type Client } from "../src/providers/opencode.ts";
+import type { SessionUsage, AgentRunner, AgentRunResult, ProgressSignal } from "../src/contracts.ts";
+import type { Provider, SessionOptions } from "../src/providers/contract.ts";
+import { ProviderError, classifyProviderError, type ProviderErrorKind } from "../src/contracts.ts";
+import { SessionLog } from "../src/sessions/writer.ts";
+import { createRuntime } from "../src/runtime.ts";
+import { OpenCodeProvider } from "../src/providers/opencode.ts";
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
 import { listRunHistory } from "../src/history.ts";
@@ -120,6 +126,7 @@ function scriptedRunner(script: { result: { outcome: AgentRunResult["outcome"]; 
   let i = 0;
   let lastUsage: SessionUsage | null = null;
   const r: AgentRunner = {
+    runtime: "scripted",
     sessionId: "s-script-" + String(scriptedRunnerSeq++),
     prompt: async () => {},
     awaitCompletion: async (_t, onProgress) => {
@@ -141,6 +148,11 @@ let scriptedRunnerSeq = 0;
 async function readEvents(dir: string): Promise<Array<Record<string, unknown>>> {
   const raw = await readFile(join(dir, ".oae", "events.jsonl"), "utf8");
   return raw.trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+/** Simulate a torn append (crash mid-write): raw bytes, no trailing newline. */
+function rawAppend(file: string, text: string): Promise<void> {
+  return appendFile(file, text, "utf8");
 }
 
 /** Write a synthetic `.oae/` with a given state + events (viewmodel fixtures). */
@@ -1206,11 +1218,12 @@ test("small requests skip the model planner entirely (no wasted session)", async
   const dir = await makeProject();
   try {
     const config = fastRecovery(await loadConfig(dir));
-    const boom: Client = {
-      session: {
-        create: async () => { throw new Error("planner session must not be created for small requests"); },
-      },
-    } as unknown as Client;
+    // Provider stub whose createSession must never be reached: small requests
+    // take the deterministic plan (contract behavior, engine-independent)
+    const boom: Provider = {
+      id: "opencode",
+      createSession: async () => { throw new Error("planner session must not be created for small requests"); },
+    };
     const plan = await makePlan(boom, config, "add a sub() function to index.js");
     assert.equal(plan.tasks.length, 1, "deterministic single-task plan");
     assert.ok(plan.summary.startsWith("Single-task fallback plan"));
@@ -1229,7 +1242,10 @@ test("large requests still use the model planner", async () => {
       ] }),
     });
     const big = "restructure the authentication module across src/auth/*.ts ".repeat(10); // > 200 chars
-    const plan = await makePlan(client, config, big);
+    const plan = await makePlan({
+      id: "opencode",
+      createSession: (opts) => OpenCodeRunner.start(client, opts),
+    }, config, big);
     assert.equal(plan.summary, "model plan", "model-assisted plan is used for large requests");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -1853,3 +1869,244 @@ async function waitFor(cond: () => boolean, ms = 10_000): Promise<void> {
     await new Promise((r) => setTimeout(r, 50));
   }
 }
+
+/* ============================== Onda 1: provider boundary & session persistence ============================== */
+
+test("provider contract: OpenCodeProvider manufactures compliant AgentRunners (runtime tagged, prompt awaited)", async () => {
+  const dir = await makeProject();
+  try {
+    const created: Array<Record<string, unknown>> = [];
+    const client = stubClient({
+      create: async (input: Record<string, unknown>) => {
+        created.push(input);
+        return { id: "ses_stub" };
+      },
+      active: async () => ({ ses_stub: { type: "running" } }),
+    });
+    const provider = OpenCodeProvider.fromClient(client);
+    assert.equal(provider.id, "opencode");
+    const runner = await provider.createSession({
+      directory: dir, title: "OAE coder task-1", agent: "build",
+      model: { providerID: "nvidia", id: "z-ai/glm-5.3-flash" }, promptText: "first prompt",
+    });
+    // contract shape: every AgentRunner member present + runtime tag
+    assert.equal(runner.runtime, "opencode");
+    assert.ok(runner.sessionId.startsWith("ses_"));
+    for (const m of ["prompt", "awaitCompletion", "interrupt", "transcriptTail", "usage"] as const) {
+      assert.equal(typeof (runner as unknown as Record<string, unknown>)[m], "function", `${m} must exist`);
+    }
+    // explicit model propagated to the runtime session, verbatim
+    assert.deepEqual(created[0]?.model, { providerID: "nvidia", id: "z-ai/glm-5.3-flash" });
+    assert.equal(created[0]?.agent, "build");
+    // a task with an idle runtime session completes; transcript/usage non-throwing
+    const r2 = await OpenCodeProvider.fromClient(stubClient({
+      active: async () => ({ ses_stub: { type: "running" } }),
+      interrupt: async () => {},
+    })).createSession({
+      directory: dir, title: "t", agent: "build", model: null, promptText: "p",
+    });
+    // interrupt() flow keeps outcome truthfully "interrupted" (never silent success)
+    await r2.interrupt();
+    const res = await r2.awaitCompletion(200);
+    assert.equal(res.outcome, "interrupted");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("provider errors: classifyProviderError maps auth/rateLimit/unavailable/protocol/unknown deterministically", () => {
+  const cases: [unknown, ProviderErrorKind][] = [
+    [new Error("HTTP 401 unauthorized"), "auth"],
+    [new Error("fetch failed: HTTP 429: rate limited"), "rateLimit"],
+    [new Error("HTTP 402 budget exceeded"), "protocol"],
+    [new Error("HTTP 500: boom"), "protocol"],
+    [new Error("connect ECONNREFUSED 127.0.0.1:4096"), "unavailable"],
+    [new Error("weird failure"), "unknown"],
+    ["bare string", "unknown"],
+  ];
+  for (const [input, want] of cases) {
+    const e = classifyProviderError(input, "opencode");
+    assert.equal(e.kind, want, String((input as Error)?.message ?? input));
+    assert.equal(e.provider, "opencode");
+  }
+  // an already-typed ProviderError passes through unchanged (no re-wrap)
+  const src = new ProviderError("auth", "opencode", "401 res");
+  const passthrough = classifyProviderError(src, "opencode");
+  assert.equal(passthrough, src);
+});
+
+test("runtime factory: createRuntime materializes an OpenCode provider honoring Provider (opt-in: real service)", { skip: process.env.OAE_RUNTIME_TEST !== "1" }, async () => {
+  const rt = await createRuntime();
+  assert.equal(typeof rt.provider.id, "string");
+  assert.equal(typeof rt.provider.createSession, "function");
+  // health is optional but, when present, must be truthful in both directions
+  if (rt.provider.healthCheck) {
+    const hc = await rt.provider.healthCheck();
+    assert.equal(typeof hc.ok, "boolean");
+  }
+});
+
+test("schema compatibility: legacy state.json without schemaVersion and legacy event lines load unchanged", async () => {
+  const dir = await makeProject();
+  try {
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    const legacy = demoState(); // no schemaVersion field
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), JSON.stringify(legacy, null, 2), "utf8");
+    await writeFile(join(dir, ".oae", "events.jsonl"),
+      `${JSON.stringify({ at: "2026-10-18T00:00:00.000Z", kind: "run_started", request: "old" })}\n`, "utf8");
+    const loaded = await Store.load(dir);
+    assert.ok(loaded);
+    assert.equal(loaded.state.schemaVersion, undefined, "legacy stays legacy on read — no silent rewrite");
+    assert.equal(loaded.state.id, "run-demo");
+    // appending new events keeps legacy lines intact and marks new ones v:1
+    const store = new Store(dir, loaded.state.id);
+    store.state = loaded.state;
+    await store.event("decision", { decisionId: "d1" });
+    const events = await readEvents(dir);
+    assert.equal(events.length, 2);
+    assert.equal("v" in events[0], false, "legacy line untouched");
+    assert.equal(events[1]?.v, 1);
+    assert.equal(events[1]?.kind, "decision");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Store.create: new runs declare schemaVersion: 1 (writable forward-compat)", async () => {
+  const dir = await makeProject();
+  try {
+    const store = await Store.create(dir, "run-v1", "req");
+    assert.equal(store.state.schemaVersion, 1);
+    const raw = JSON.parse(await readFile(join(dir, ".oae", "state.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(raw.schemaVersion, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("session rollout: append-only events persist, survive partial trailing writes, and isolate per attempt", async () => {
+  const dir = await makeProject();
+  try {
+    const log = new SessionLog(dir);
+    assert.equal(await log.append("task-1-a1", "dispatch", { runtime: "opencode", sessionId: "ses_x" }), true);
+    assert.equal(await log.append("task-1-a1", "result", { outcome: "completed", tokens: null }), true);
+    // distinct attempt keys do not bleed into each other
+    await log.append("task-1-a2", "dispatch", { sessionId: "ses_y" });
+    // simulate a crash mid-write: append a torn trailing line raw
+    const file = join(dir, ".oae", "sessions", "task-1-a1.jsonl");
+    rawAppend(file, '{"at":"2026-10-19T00');
+    // tolerant read: recorded complete events survive, torn one dropped
+    const eventsA = await log.read("task-1-a1");
+    assert.equal(eventsA.length, 2);
+    assert.equal(eventsA[0]?.kind, "dispatch");
+    assert.equal(eventsA[1]?.kind, "result");
+    assert.deepEqual(eventsA[1]?.tokens, null);
+    const eventsB = await log.read("task-1-a2");
+    assert.equal(eventsB.length, 1);
+    // sanitized key: hostile attemptId cannot traverse out of .oae/sessions
+    const hostile = "task/../..%2Fescape";
+    await log.append(hostile, "dispatch", {});
+    const files = await readdir(join(dir, ".oae", "sessions"));
+    assert.ok(files.every((f) => !f.includes("/") && f !== "." && f !== ".."), "every log file stays put");
+    assert.ok(files.includes("task_.._.._2Fescape.jsonl"), "hostile key sanitized deterministically");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("session rollout: write failures degrade to observability loss, never to run failure", async () => {
+  const dir = await makeProject();
+  try {
+    const log = new SessionLog(dir);
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    // root-proof failure: `.oae/sessions` exists as a FILE, so mkdir/append
+    // cannot proceed — the log must fail soft (false), never throw
+    await writeFile(join(dir, ".oae", "sessions"), "not a directory", "utf8");
+    assert.equal(await log.append("blocked-attempt", "dispatch", {}), false, "write fails softly");
+    assert.deepEqual(await log.read("blocked-attempt"), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("orchestrator + session log: real attempts record dispatch/result into .oae/sessions without altering outcomes", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-slog", "add hello module");
+    const reviewer = new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : reviewer),
+    });
+    const { state } = await orch.run("add hello module");
+    assert.equal(state.tasks[0].status, "done");
+    const sessDir = join(dir, ".oae", "sessions");
+    const files = (await readdir(sessDir)).sort();
+    assert.ok(files.some((f) => f.startsWith("task-1-a1")), "coder attempt logged");
+    assert.ok(files.some((f) => f.startsWith("task-1-a2")), "review attempt logged");
+    const codeEvents = await new SessionLog(dir).read("task-1-a1");
+    assert.equal(codeEvents[0]?.v, 1);
+    assert.equal(codeEvents[0]?.kind, "dispatch");
+    assert.equal(codeEvents[0]?.phase, "code");
+    assert.equal(codeEvents[0]?.sessionId, "s-code");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("orchestrator: a throwing session log must not change outcomes (best-effort observability)", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    const store = await Store.create(dir, "run-slogfail", "add hello module");
+    const broken: SessionLog = {
+      append: async () => { throw new Error("disk gone"); },
+      read: async () => { throw new Error("disk gone"); },
+    } as unknown as SessionLog;
+    const reviewer = new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK });
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : reviewer),
+      sessionLog: broken,
+    });
+    const { state } = await orch.run("add hello module");
+    assert.equal(state.status, "done");
+    assert.equal(state.tasks[0].status, "done", "run outcome identical with logging broken");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("model propagation: provider receives the same explicit model for coder AND reviewer sessions", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.model = { providerID: "nvidia", id: "z-ai/glm-5.3-flash" };
+    const store = await Store.create(dir, "run-mprop", "add hello module");
+    const sessions: Array<{ agent?: unknown; model?: unknown; runtime?: unknown }> = [];
+    class PropagatingProvider implements Provider {
+      id = "fake";
+      async createSession(opts: SessionOptions): Promise<AgentRunner> {
+        sessions.push({ agent: opts.agent, model: opts.model, runtime: opts.model ? `${opts.model.providerID}/${opts.model.id}` : null });
+        // contract: the provider dispatches the first prompt at creation time
+        const runner = new FakeRunner(`s-${sessions.length}`, { type: "complete", output: REVIEWER_OK });
+        await runner.prompt(opts.promptText);
+        return runner;
+      }
+    }
+    const orch = new Orchestrator(new PropagatingProvider(), store, { config, plan: plan1(dir) });
+    const { state } = await orch.run("add hello module");
+    assert.equal(state.tasks[0].status, "done");
+    const coder = sessions.find((s) => s.agent === config.coderAgent);
+    const review = sessions.find((s) => s.agent === config.reviewerAgent);
+    assert.ok(coder && review, "both sessions created via the provider");
+    assert.deepEqual(coder.model, { providerID: "nvidia", id: "z-ai/glm-5.3-flash" });
+    assert.deepEqual(review.model, { providerID: "nvidia", id: "z-ai/glm-5.3-flash" });
+    assert.equal(coder.runtime, "nvidia/z-ai/glm-5.3-flash");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("orchestrator: dispatch without provider and without runnerFactory fails honestly (never silently 'done')", async () => {
+  const dir = await makeProject();
+  try {
+    const config = fastRecovery(await loadConfig(dir));
+    config.recovery.maxAttempts = 1;
+    const store = await Store.create(dir, "run-noprov", "add hello module");
+    const orch = new Orchestrator(null, store, { config, plan: plan1(dir) });
+    const { state } = await orch.run("add hello module");
+    // the run must NOT report success: attempt fails, task ends not-done
+    assert.notEqual(state.status, "done");
+    assert.notEqual(state.tasks[0].status, "done");
+    assert.ok(["blocked", "failed", "cancelled"].includes(state.tasks[0].status), `status: ${state.tasks[0].status}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

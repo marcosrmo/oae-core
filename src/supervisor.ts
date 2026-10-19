@@ -14,7 +14,7 @@
  * validators/runCommand; the supervisor only reacts to *global* task stalls.
  */
 import { nowISO, truncate } from "./util.ts";
-import type { AgentRunner, ProgressSignal } from "./opencode.ts";
+import type { AgentRunner, ProgressSignal } from "./contracts.ts";
 import type { Store, Task } from "./store.ts";
 import type { RecoveryConfig } from "./config.ts";
 

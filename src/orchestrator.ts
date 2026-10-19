@@ -6,8 +6,9 @@
  * Supervision runs on a periodic ticker inside run(), independent from the
  * task loops, so a stalled agent is interrupted even while other work waits.
  */
-import type { Client, AgentRunner } from "./opencode.ts";
-import { OpenCodeRunner } from "./opencode.ts";
+import type { AgentRunner, ProviderModelRef, SessionUsage } from "./contracts.ts";
+import type { Provider } from "./providers/contract.ts";
+import { SessionLog } from "./sessions/writer.ts";
 import type { OaeConfig } from "./config.ts";
 import { Store, type Task, type RunState } from "./store.ts";
 import type { Plan } from "./planner.ts";
@@ -26,6 +27,8 @@ export interface RunOptions {
   dryRun?: boolean;
   /** Deterministic injectable runners for tests. */
   runnerFactory?: (kind: "coder" | "reviewer", task: Task) => AgentRunner;
+  /** Injectable session log (tests inject a temp-dir writer; null disables logging). */
+  sessionLog?: SessionLog | null;
   /** Override supervision sweep interval (ms) for tests. */
   sweepIntervalMs?: number;
   /** Injectable clock for deterministic supervision tests. */
@@ -94,19 +97,31 @@ interface ReviewVerdict {
 
 export class Orchestrator {
   private supervisor: Supervisor;
-  private client: Client | null;
+  private provider: Provider | null;
   private store: Store;
   private opts: RunOptions;
 
-  constructor(client: Client | null, store: Store, opts: RunOptions) {
-    this.client = client;
+  constructor(provider: Provider | null, store: Store, opts: RunOptions) {
+    this.provider = provider;
     this.store = store;
     this.opts = opts;
     this.sleeper = opts.sleepFn ?? ((ms: number) => sleep(ms));
+    this.sessionLog = opts.sessionLog === undefined ? new SessionLog(opts.config.projectDir) : (opts.sessionLog ?? null);
     this.supervisor = new Supervisor(opts.config.recovery, store, opts.clock ?? { now: () => Date.now() });
   }
 
   private sleeper: (ms: number) => Promise<void>;
+  private sessionLog: SessionLog | null;
+
+  /**
+   * Best-effort per-attempt rollout record (.oae/sessions/<key>.jsonl).
+   * Observability only: a logging failure is swallowed and must never
+   * influence attempt outcomes (the persisted attempt in state.json
+   * remains the authority).
+   */
+  private async recordSession(attempt: { id: number }, taskId: string, kind: string, data: Record<string, unknown>): Promise<void> {
+    try { await this.sessionLog?.append(`${taskId}-a${attempt.id}`, kind, data); } catch { /* observability only */ }
+  }
 
   async run(request: string): Promise<{ state: RunState }> {
     const cfg = this.opts.config;
@@ -137,7 +152,7 @@ export class Orchestrator {
     });
 
     // plan
-    const plan = this.opts.plan ?? await makePlan(this.client, cfg, request);
+    const plan = this.opts.plan ?? await makePlan(this.provider, cfg, request);
     for (const v of plan.validators) {
       if (!cfg.validators.find((x) => x.name === v.name)) cfg.validators.push(v);
     }
@@ -278,7 +293,9 @@ export class Orchestrator {
       await runner.prompt(prompt);
       return { runner, prompt };
     }
-    const runner = await OpenCodeRunner.start(this.client!, {
+    const provider = this.provider;
+    if (!provider) throw new Error("no provider runtime configured");
+    const runner = await provider.createSession({
       directory: cfg.projectDir,
       title: `OAE ${kind} ${task.id}`,
       agent,
@@ -288,7 +305,7 @@ export class Orchestrator {
     return { runner, prompt };
   }
 
-  private async collectUsage(runner: AgentRunner): Promise<import("./opencode.ts").SessionUsage | null> {
+  private async collectUsage(runner: AgentRunner): Promise<SessionUsage | null> {
     if (!runner.usage) return null;
     try { return await runner.usage(); } catch { return null; }
   }
@@ -302,10 +319,21 @@ export class Orchestrator {
       sessionId: rev.runner.sessionId, agent: cfg.reviewerAgent, kind: "review",
       startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
     });
+    await this.recordSession(revAttempt, task.id, "dispatch", {
+      taskId: task.id, attemptId: revAttempt.id, phase: "review", agent: cfg.reviewerAgent,
+      runtime: rev.runner.runtime, sessionId: rev.runner.sessionId,
+      model: cfg.model ? `${cfg.model.providerID}/${cfg.model.id}` : "service default",
+    });
     const revRes = await rev.runner.awaitCompletion(5 * 60_000, (s) =>
       this.emit("agent_progress", { taskId: task.id, attemptId: revAttempt.id, phase: "review", signalKind: s.kind, detail: s.detail }));
     const verdict = parseVerdict(revRes.output);
     const revUsage = await this.collectUsage(rev.runner);
+    await this.recordSession(revAttempt, task.id, "result", {
+      taskId: task.id, attemptId: revAttempt.id, phase: "review",
+      outcome: verdict?.verdict ?? "unparseable", runtime: rev.runner.runtime, sessionId: rev.runner.sessionId,
+      output: truncate(revRes.output, 2000),
+      tokens: revUsage ?? null,
+    });
     await this.store.finishAttempt(task.id, revAttempt.id, {
       outcome: verdict?.verdict === "approve" ? "approved" : "rejected",
       summary: verdict?.summary ?? truncate(revRes.output, 500),
@@ -341,6 +369,11 @@ export class Orchestrator {
         sessionId: runner.sessionId, agent: cfg.coderAgent, kind: "code",
         startedAt: nowISO(), outcome: "running", summary: "", filesChanged: [], evidence: {},
       });
+      await this.recordSession(attempt, task.id, "dispatch", {
+        taskId: task.id, attemptId: attempt.id, phase: "code", agent: cfg.coderAgent,
+        runtime: runner.runtime, sessionId: runner.sessionId,
+        model: cfg.model ? `${cfg.model.providerID}/${cfg.model.id}` : "service default",
+      });
       const res = await runner.awaitCompletion(cfg.recovery.taskTimeoutMs - (Date.now() - taskStart), (s) => {
         this.supervisor.noteSignal(task.id, s);
         // `signalKind` (not `kind`): Store.event's spread would otherwise
@@ -348,6 +381,12 @@ export class Orchestrator {
         this.emit("agent_progress", { taskId: task.id, attemptId: attempt.id, phase: "code", signalKind: s.kind, detail: s.detail });
       });
       const usage = await this.collectUsage(runner);
+      await this.recordSession(attempt, task.id, "result", {
+        taskId: task.id, attemptId: attempt.id, phase: "code",
+        outcome: res.outcome, runtime: runner.runtime, sessionId: runner.sessionId,
+        output: truncate(res.output, 2000),
+        tokens: usage ?? null,
+      });
       await this.store.finishAttempt(task.id, attempt.id, {
         outcome: res.outcome === "completed" ? "completed" : "interrupted",
         summary: truncate(res.output, 1000),
@@ -358,6 +397,10 @@ export class Orchestrator {
         // structured observability: interruption vs provider/runtime failure
         if (res.outcome === "interrupted") {
           this.emit("session_interrupted", { taskId: task.id, attemptId: attempt.id, sessionId: runner.sessionId, detail: truncate(res.output || "interrupted before completion", 300) });
+          await this.recordSession(attempt, task.id, "interrupt", {
+            taskId: task.id, attemptId: attempt.id, sessionId: runner.sessionId,
+            detail: res.output ? truncate(res.output, 500) : "interrupted before completion",
+          });
         } else {
           const f = classifyProviderFailure(res.output);
           this.emit("provider_error", {

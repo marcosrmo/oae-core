@@ -54,6 +54,8 @@ export interface Decision {
 export type RunStatus = "running" | "done" | "failed" | "cancelled" | "interrupted";
 
 export interface RunState {
+  /** Bumped on new accretive schema fields; without it = legacy (pre-Onda1). */
+  schemaVersion?: 1;
   id: string;
   request: string;
   projectDir: string;
@@ -86,6 +88,9 @@ export class Store {
     // preservation; `oae history` keeps it readable after the overwrite)
     await archivePreviousRun(projectDir, runId);
     s.state = {
+      // Onda 1: new runs declare this schema version; legacy files without
+      // the field load unchanged (loader treats absence as legacy v0)
+      schemaVersion: 1,
       id: runId,
       request,
       projectDir,
@@ -132,7 +137,9 @@ export class Store {
   }
 
   async event(kind: string, data: Record<string, unknown>): Promise<void> {
-    const rec: Record<string, unknown> = { ...data, at: nowISO(), kind };
+    // `v`: per-line versioning (Onda 1). Legacy lines without `v` stay valid;
+    // readers must tolerate both and never assume a fixed field set.
+    const rec: Record<string, unknown> = { ...data, at: nowISO(), kind, v: 1 };
     await appendJsonl(this.eventsFile, rec);
     for (const l of this.listeners) {
       try { l(rec); } catch { /* observation must never break the run */ }
