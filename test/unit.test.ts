@@ -19,7 +19,7 @@ import { inspectGit, prepareGit, commitAll } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
-import { createProgressReporter, progressFrame, progressLine, redact } from "../src/progress.ts";
+import { createProgressReporter, progressFrame, progressLine, redact, redactTruncatedTail } from "../src/progress.ts";
 import { OpenCodeRunner, type Client } from "../src/providers/opencode.ts";
 import type { SessionUsage, AgentRunner, AgentRunResult, ProgressSignal } from "../src/contracts.ts";
 import type { Provider, SessionOptions } from "../src/providers/contract.ts";
@@ -31,6 +31,7 @@ import { HttpTransport, TRANSPORT_CAPS, type ChatReply } from "../src/providers/
 import { FileToolSet, FILE_TOOL_LIMITS } from "../src/providers/http/filetools.ts";
 import { NVIDIAProvider } from "../src/providers/nvidia.ts";
 import { normalizeProviderSelection } from "../src/runtime.ts";
+import { OpenRouterProvider } from "../src/providers/openrouter.ts";
 import { loadRunView, type RunView } from "../src/viewmodel.ts";
 import { renderSummary, renderResultLine } from "../src/dashboard.ts";
 import { listRunHistory } from "../src/history.ts";
@@ -2540,7 +2541,10 @@ test("runtime: nvidia-direct selection never opens the OpenCode path; unknown se
   assert.equal(normalizeProviderSelection(undefined), "opencode");
   assert.equal(normalizeProviderSelection("nvidia"), "nvidia-direct");
   assert.equal(normalizeProviderSelection("opencode"), "opencode");
-  assert.throws(() => normalizeProviderSelection("openrouter"), /unknown provider selection/);
+  // stage 2: "openrouter" became a VALID alias of openrouter-direct (see the
+  // dedicated openrouter selection tests) — this gate now pins a test case
+  // that is still invalid
+  assert.throws(() => normalizeProviderSelection("openrouters"), /unknown provider selection/);
 });
 
 // ── FileToolSet isolation (root confinement, strict schemas, caps) ─────────
@@ -2963,4 +2967,669 @@ test("nvidia runner A5: a secret straddling the truncation boundary leaves no vi
       assert.match(s.detail, /\[redact/);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ── Onda 2 / Etapa 2 — OpenRouter direto + A1/A4 do transporte ───────────────
+
+const ORKEY = "sk-or-unit-test-key-abcdef0123456789";
+const ORPROVIDER = {
+  provider: "openrouter-direct",
+  baseUrl: "https://openrouter.test/api/v1",
+  apiKey: ORKEY,
+  includeUsage: false,
+} as const;
+
+const OR_MODEL = { providerID: "openrouter", id: "z-ai/glm-4.6" };
+
+/** Pull-driven bounded stream: each pull hands out one fresh chunk until the
+ * budget ends, so the TEST never materializes the payload in memory either.
+ * `consumed` counts exactly what the CONSUMER pulled from the wire. */
+function oversizedResponse(opts: { status: number; contentType: string; bodyBytes: number; chunkBytes?: number }): {
+  res: Response;
+  consumed: () => number;
+} {
+  const chunkBytes = opts.chunkBytes ?? 16_384;
+  let produced = 0;
+  let pulledBytes = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (produced >= opts.bodyBytes) { controller.close(); return; }
+      const n = Math.min(chunkBytes, opts.bodyBytes - produced);
+      const chunk = new Uint8Array(n); // oversized content bytes are irrelevant
+      produced += n;
+      pulledBytes += n;
+      controller.enqueue(chunk);
+    },
+    cancel() { produced = opts.bodyBytes; }, // cap reached: source stops
+  });
+  return {
+    res: new Response(stream, { status: opts.status, headers: { "content-type": opts.contentType } }),
+    consumed: () => pulledBytes,
+  };
+}
+
+test("openrouter: selection resolves openrouter-direct (exact + aliases; unknown throws)", () => {
+  assert.equal(normalizeProviderSelection("openrouter-direct"), "openrouter-direct");
+  assert.equal(normalizeProviderSelection("openrouter"), "openrouter-direct");
+  assert.equal(normalizeProviderSelection("openrouter_direct"), "openrouter-direct");
+  assert.throws(() => normalizeProviderSelection("openrouterish"), /unknown provider selection/, "honest early throw");
+  assert.throws(() => normalizeProviderSelection("nvidia-opencode"), /unknown provider selection/);
+});
+
+test("openrouter: createRuntime materializes the direct provider without any OpenCode import", async () => {
+  const prev = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = ORKEY;
+  try {
+    const rt = await createRuntime({ selection: "openrouter-direct" });
+    assert.equal(rt.provider.id, "openrouter-direct");
+    assert.equal(rt.endpoint?.url, "https://openrouter.ai/api/v1");
+    assert.ok(rt.provider.healthCheck instanceof Function);
+  } finally {
+    if (prev === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prev;
+  }
+});
+
+test("openrouter: missing OPENROUTER_API_KEY fails fast with a secret-free error", async () => {
+  const prevOR = process.env.OPENROUTER_API_KEY;
+  const prevLegacy = process.env.OAE_OPENROUTER_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.OAE_OPENROUTER_API_KEY;
+  try {
+    // start() is synchronous: a configuration error throws eagerly — the run
+    // forfeits before any session attempt burns against a dead endpoint
+    await assert.rejects(
+      () => new Promise<unknown>((resolve, reject) => {
+        try { resolve(OpenRouterProvider.start()); } catch (e) { reject(e); }
+      }),
+      (e: unknown) => {
+        const m = (e as Error).message;
+        assert.match(m, /OPENROUTER_API_KEY is not set/);
+        assert.doesNotMatch(m, /sk-or-/, "no key material in the error");
+        assert.doesNotMatch(m, /Bearer/, "no header echo");
+        return true;
+      },
+    );
+  } finally {
+    if (prevOR !== undefined) process.env.OPENROUTER_API_KEY = prevOR;
+    if (prevLegacy !== undefined) process.env.OAE_OPENROUTER_API_KEY = prevLegacy;
+  }
+});
+
+test("openrouter: no invented default model — createSession requires an explicit model", async () => {
+  const dir = await makeProject();
+  try {
+    const provider = OpenRouterProvider.start({ apiKey: ORKEY });
+    await assert.rejects(
+      () => provider.createSession({ directory: dir, title: "t", agent: "build", model: null, promptText: "x" }),
+      /no model selected/,
+    );
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("openrouter: request builds official endpoint, auth-only headers and the requested model", async () => {
+  const dir = await makeProject();
+  try {
+    const { calls, fetch: f } = recordingFetch(() => sseResponseBody([contentEvent("ok"), finishEvent("stop"), DONE_MARKER]));
+    const provider = OpenRouterProvider.start({ apiKey: ORKEY, fetchImpl: f, baseUrl: "https://openrouter.test/api/v1" });
+    await provider.createSession({ directory: dir, title: "t", agent: "build", model: OR_MODEL, promptText: "hi" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, "https://openrouter.test/api/v1/chat/completions");
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    assert.equal(headers["authorization"], `Bearer ${ORKEY}`);
+    assert.equal(headers["content-type"], "application/json");
+    assert.equal(Object.keys(headers).filter((k) => !["authorization", "content-type", "accept"].includes(k)).length, 0, "no invented attribution headers");
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>;
+    assert.equal(body.model, "z-ai/glm-4.6", "model id travels verbatim (author/slug)");
+    assert.equal(body.stream, true);
+    assert.equal("stream_options" in body, false, "OpenRouter: legacy include_usage is omitted");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("openrouter: streaming honors OPENROUTER PROCESSING keepalives and the non-empty usage chunk", async () => {
+  // usage frame repeats finish_reason with a content-free delta (OpenRouter
+  // deviation from OpenAI) — the shared parser must treat it as accounting
+  const parts = [
+    ": OPENROUTER PROCESSING\n\n",
+    contentEvent("hello "),
+    ": OPENROUTER PROCESSING\n\n",
+    contentEvent("router"),
+    sseEvent({ id: "g1", choices: [{ index: 0, delta: { content: "", role: "assistant" }, finish_reason: "stop", native_finish_reason: "stop" }] }),
+    sseEvent({ id: "g1", choices: [{ index: 0, delta: { content: "", role: "assistant" }, finish_reason: "stop" }], usage: { prompt_tokens: 11, completion_tokens: 7 } }),
+    DONE_MARKER,
+  ];
+  const { fetch: f } = recordingFetch(() => sseResponseBody(parts));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "z-ai/glm-4.6", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.content, "hello router");
+  assert.equal(rep.finishReason, "stop");
+  assert.equal(rep.usage?.input, 11);
+  assert.equal(rep.usage?.output, 7);
+});
+
+test("openrouter: mid-stream top-level error event ends the round as a classified failure", async () => {
+  const { fetch: f } = recordingFetch(() => sseResponseBody([
+    sseEvent({ id: "g1", choices: [{ index: 0, delta: { content: "" }, finish_reason: null }] }),
+    sseEvent({ id: "g1", error: { code: 502, message: "Provider disconnected unexpectedly" }, choices: [{ index: 0, delta: { content: "" }, finish_reason: "error" }] }),
+    DONE_MARKER,
+  ]));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "z-ai/glm-4.6", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "unavailable", "HTTP 502-style code classifies through the central table");
+      assert.match((e as ProviderError).message, /mid-stream provider error \(code 502\)/);
+    },
+  );
+});
+
+test("openrouter: mid-stream error without numeric kind is unavailable and redacted", async () => {
+  const secret = "sk-or-v1-0123456789abcdefghij";
+  const { fetch: f } = recordingFetch(() => sseResponseBody([
+    sseEvent({ error: { code: "server_error", message: `auth failed upstream: ${secret}` }, choices: [{ index: 0, delta: {}, finish_reason: "error" }] }),
+  ]));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "z-ai/glm-4.6", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "unavailable");
+      assert.match((e as ProviderError).message, /mid-stream provider error:/);
+      assert.doesNotMatch((e as ProviderError).message, RegExp(secret), "no key material");
+      assert.match((e as ProviderError).message, /\[redacted\]/);
+    },
+  );
+});
+
+test("openrouter: gateway rejecting streaming gets one non-streaming retry without stream_options", async () => {
+  let n = 0;
+  const { calls, fetch: f } = recordingFetch(() => {
+    n++;
+    if (n === 1) return jsonResponse({ error: { message: "this provider requires stream:false (stream unsupported)" } }, 400);
+    return jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "plain answer" }, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2 } });
+  });
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "z-ai/glm-4.6", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.content, "plain answer");
+  assert.equal(calls.length, 2);
+  const body2 = JSON.parse(String(calls[1]!.init.body)) as Record<string, unknown>;
+  assert.equal(body2.stream, false);
+  assert.equal("stream_options" in body2, false);
+});
+
+test("openrouter transport: valid non-streaming tool calls stay inside the slot cap", async () => {
+  const toolCalls: Record<string, unknown>[] = [];
+  for (let i = 0; i < TRANSPORT_CAPS.toolSlotsMax; i++) {
+    toolCalls.push({ id: `call_${i}`, type: "function", function: { name: "write_file", arguments: `{"path":"f${i}.txt","content":"x"}` } });
+  }
+  const { fetch: f } = recordingFetch(() => jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: toolCalls }, finish_reason: "tool_calls" }] }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "z-ai/glm-4.6", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.equal(rep.toolCalls?.length, TRANSPORT_CAPS.toolSlotsMax);
+});
+
+test("A4: non-streaming tool_calls flood ends in a controlled protocol error", async () => {
+  const toolCalls: Record<string, unknown>[] = [];
+  for (let i = 0; i < TRANSPORT_CAPS.toolSlotsMax + 5; i++) {
+    toolCalls.push({ id: `call_${i}`, type: "function", function: { name: "t", arguments: "{}" } });
+  }
+  const { fetch: f } = recordingFetch(() => jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: toolCalls } }] }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "protocol");
+      assert.match((e as ProviderError).message, /more than 32 tool calls \(non-streaming/);
+    },
+  );
+});
+
+test("A1: an oversize ERROR body is read only up to the excerpt cap (never materialized)", async () => {
+  const BODY = 1_000_000;
+  const CAP = TRANSPORT_CAPS.errorExcerptBytes;
+  const { res, consumed } = oversizedResponse({ status: 502, contentType: "text/html", bodyBytes: BODY });
+  const { fetch: f } = recordingFetch(() => res);
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof ProviderError);
+  assert.equal((err as ProviderError).kind, "unavailable");
+  assert.match((err as ProviderError).message, /body truncated/);
+  const pulled = consumed();
+  // THE assertion that proves incremental reading: the consumer pulled at
+  // most cap + two chunks (one plain chunk + one stream-queue prefetch) —
+  // res.text() (old behavior) would have pulled the whole 1MB body
+  assert.ok(pulled <= CAP + 2 * 16_384 + 1, `pulled=${pulled} must be bounded by cap+prefetch, not the 1MB body`);
+  assert.ok(pulled < BODY / 10);
+});
+
+test("A1: an oversize SUCCESS body stops at the cap and fails as a controlled protocol error", async () => {
+  const CAP = TRANSPORT_CAPS.successBodyBytes;
+  const BODY = CAP + 64_000;
+  const { res, consumed } = oversizedResponse({ status: 200, contentType: "application/json", bodyBytes: BODY });
+  const { fetch: f } = recordingFetch(() => res);
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof ProviderError);
+  assert.equal((err as ProviderError).kind, "protocol");
+  assert.match((err as ProviderError).message, /exceeded the 4000000 byte cap/);
+  assert.ok(consumed() <= CAP + 2 * 16_384 + 1, "no full materialization of the oversized body");
+});
+
+test("A1: a bounded stream read that errors mid-way degrades to honest partial text", async () => {
+  const encoder = new TextEncoder();
+  let pulled = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled === 0) { pulled++; controller.enqueue(encoder.encode("partial error context ")); return; }
+      controller.error(new Error("connection reset mid-read"));
+    },
+  });
+  const { fetch: f } = recordingFetch(() => new Response(stream, { status: 500, headers: { "content-type": "text/plain" } }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.match((e as ProviderError).message, /read interrupted after \d+ bytes/);
+    },
+  );
+});
+
+test("openrouter: malformed non-streaming body and missing choices fail as protocol", async () => {
+  const { fetch: f1 } = recordingFetch(() => new Response("not json{", { status: 200, headers: { "content-type": "application/json" } }));
+  const t1 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f1 });
+  await t1.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => { assert.match((e as ProviderError).message, /malformed non-streaming JSON/); },
+  );
+  const { fetch: f2 } = recordingFetch(() => jsonResponse({ object: "chat.completion", usage: undefined }));
+  const t2 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f2 });
+  await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => { assert.match((e as ProviderError).message, /no choices/); },
+  );
+});
+
+test("openrouter: network failure classifies as unavailable; retry later gates still work", async () => {
+  const { fetch: f } = recordingFetch(() => { throw new Error("ECONNREFUSED 127.0.0.1:443"); });
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      assert.ok(e instanceof ProviderError);
+      assert.equal((e as ProviderError).kind, "unavailable");
+    },
+  );
+});
+
+test("openrouter: credentials never appear in errors, signals or transcript", async () => {
+  const dir = await makeProject();
+  try {
+    const secret = ORKEY;
+    let n = 0;
+    const { fetch: f } = recordingFetch(() => {
+      n++;
+      if (n === 1) return sseResponseBody([buildToolCallReply({ name: "write_file", args: `{"path":"a.txt","content":"key ${secret} in args"}` })]);
+      return sseResponseBody([contentEvent("done with key"), finishEvent("stop"), DONE_MARKER]);
+    });
+    const provider = OpenRouterProvider.start({ apiKey: secret, fetchImpl: f, baseUrl: "https://openrouter.test/api/v1" });
+    const runner = await provider.createSession({ directory: dir, title: "t", agent: "build", model: OR_MODEL, tools: true, promptText: "x", toolExecutor: { execute: async () => "ok" } });
+    const res = await runner.awaitCompletion(10_000);
+    assert.equal(res.outcome, "completed");
+    const escaped = RegExp(secret);
+    for (const s of res.signals) assert.doesNotMatch(s.detail, escaped, `${s.kind} signal carries no key`);
+    const tail = await runner.transcriptTail(30);
+    assert.doesNotMatch(tail, escaped, "transcript tail carries no key");
+    assert.match(tail, /\[redact/, "redaction marker present (sk-or maps through the sk- pattern)");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("openrouter runner: interrupt during an in-flight SSE round settles exactly once", async () => {
+  const dir = await makeProject();
+  try {
+    const { fetch: f } = recordingFetch(() => sseResponseBody([contentEvent("slow"), finishEvent("stop"), DONE_MARKER], { chunkDelayMs: 200 }));
+    const provider = OpenRouterProvider.start({ apiKey: ORKEY, fetchImpl: f, baseUrl: "https://openrouter.test/api/v1" });
+    const runner = await provider.createSession({ directory: dir, title: "t", agent: "build", model: OR_MODEL, promptText: "slow" });
+    setTimeout(() => { void runner.interrupt(); }, 100);
+    const res = await runner.awaitCompletion(30_000);
+    assert.equal(res.outcome, "interrupted");
+    const res2 = await runner.awaitCompletion(5_000);
+    assert.equal(res2, res, "settlement exactly once");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("includeUsage divergence pins: nvidia keeps stream_options, openrouter omits it", async () => {
+  const { calls: nCalls, fetch: nf } = recordingFetch(() => sseResponseBody([contentEvent("x"), finishEvent("stop"), DONE_MARKER]));
+  const nt = new HttpTransport({ ...TPROVIDER, fetchImpl: nf });
+  await nt.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  const nBody = JSON.parse(String(nCalls[0]!.init.body)) as Record<string, unknown>;
+  assert.deepEqual(nBody.stream_options, { include_usage: true });
+
+  const { calls: oCalls, fetch: of } = recordingFetch(() => sseResponseBody([contentEvent("x"), finishEvent("stop"), DONE_MARKER]));
+  const ot = new HttpTransport({ ...ORPROVIDER, fetchImpl: of });
+  await ot.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  const oBody = JSON.parse(String(oCalls[0]!.init.body)) as Record<string, unknown>;
+  assert.equal("stream_options" in oBody, false);
+});
+
+/** REAL OpenRouter run — opt-in, NEVER executed while authorizing this task.
+ * Enable with: OAE_OPENROUTER_REAL=1, OPENROUTER_API_KEY set and
+ * OAE_OPENROUTER_REAL_MODEL=<author>/<slug> (the model is required: the
+ * provider must not invent ids). Costs real tokens; isolation and caps
+ * follow the Onda-1 protocol when authorized. */
+test("openrouter DIRECT REAL RUN (opt-in: OAE_OPENROUTER_REAL=1)", { skip: process.env.OAE_OPENROUTER_REAL !== "1" }, async () => {
+  const model = process.env.OAE_OPENROUTER_REAL_MODEL;
+  if (!model) {
+    throw new Error("OAE_OPENROUTER_REAL is set but OAE_OPENROUTER_REAL_MODEL is unset — the provider must not invent model ids");
+  }
+  const provider = OpenRouterProvider.start(); // honest throw if the key is absent
+  const dir = await mkdtemp(join(tmpdir(), "oae-or-real-"));
+  try {
+    const runner = await provider.createSession({
+      directory: dir, title: "openrouter real one-shot", agent: "build",
+      model: { providerID: "openrouter", id: model },
+      tools: true, promptText: "Create the file check.txt containing exactly OR_OK and then reply with just: DONE",
+    });
+    const res = await runner.awaitCompletion(900_000);
+    assert.equal(res.outcome, "completed");
+    const check = await readFile(join(dir, "check.txt"), "utf8");
+    assert.match(check, /OR_OK/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ── Correções pós-auditoria Etapa 2: R3 e R4 ────────────────────────────────
+
+test("R3: non-streaming drops structurally empty tool_calls, keeping valid ones (SSE parity)", async () => {
+  const valid = (i: number): Record<string, unknown> => ({ id: `real_${i}`, type: "function", function: { name: "write_file", arguments: `{"path":"f${i}.txt","content":"x"}` } });
+  const malformed = { id: "ghost", type: "function" } as unknown; // no function field at all
+  const { fetch: f1 } = recordingFetch(() => jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: [valid(0), malformed, valid(1)] }, finish_reason: "tool_calls" }] }));
+  const t1 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f1 });
+  const rep = await t1.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) });
+  assert.deepEqual(rep.toolCalls?.map((t) => t.id), ["real_0", "real_1"], "valid calls untouched; empty item dropped");
+
+  // all-empty + no content → protocol error (same honest failure as before)
+  const { fetch: f2 } = recordingFetch(() => jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "", tool_calls: [malformed, malformed] } }] }));
+  const t2 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f2 });
+  await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => { assert.match((e as ProviderError).message, /empty content and no tool calls/); },
+  );
+});
+
+test("R4: an abort during a never-ending error-body read ends in finite time with honest text", async () => {
+  // mock-vs-real gap closed: a mock whose body NEVER resolves would hang
+  // errorFrom forever; with the signal wired into readBounded, the abort
+  // unwinds the read (in real fetch the body stream also rejects directly)
+  const hang = new ReadableStream<Uint8Array>({ start() { /* never enqueue, never close */ } });
+  const { fetch: f } = recordingFetch(() => new Response(hang, { status: 502, headers: { "content-type": "text/plain" } }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const ac = new AbortController();
+  const started = Date.now();
+  const h = t.open({ model: "m", messages: [{ role: "user", content: "u" }], signal: ac.signal });
+  setTimeout(() => ac.abort(), 120);
+  const err = await h.dispatched.then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof ProviderError);
+  assert.match((err as ProviderError).message, /read aborted by interrupt/);
+  assert.ok(Date.now() - started < 5_000, "finite-time settlement (no hang on the hanging mock body)");
+});
+
+test("R4: an abort during the 400-probe read is bounded as well", async () => {
+  const hang = new ReadableStream<Uint8Array>({ start() { /* never enqueue */ } });
+  let n = 0;
+  const { fetch: f } = recordingFetch(() => {
+    n++;
+    return new Response(hang, { status: n === 1 ? 400 : 502, headers: { "content-type": "text/plain" } });
+  });
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const ac = new AbortController();
+  const h = t.open({ model: "m", messages: [{ role: "user", content: "u" }], signal: ac.signal });
+  setTimeout(() => ac.abort(), 120);
+  const err = await h.dispatched.then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof ProviderError);
+  assert.match((err as ProviderError).message, /read aborted by interrupt/);
+});
+
+// ── Correções de segurança pós-auditoria: R2 (redação x truncamento) e R1 (cap do buffer de linha SSE) ──
+
+test("R2: error excerpt masks a secret straddling the 2 KB truncation boundary (multiple secret shapes)", async () => {
+  // the 2 KB cap cuts excerpt.text; a token partially visible there escaped
+  // plain redact() (which needs ≥8 chars after its stem). For each shape the
+  // FULL key sits in the body with only `visible` chars under the 2000-char
+  // cut: before the fix, `visible` (a stem + a few chars) leaked into the
+  // error message. A space guarantees the \b stem boundary matches.
+  const cases: { key: string; visible: string; stemRe: RegExp }[] = [
+    { key: "sk-or-v1-0123456789abcdefgh", visible: "sk-or-v1-0", stemRe: /sk-or/i },
+    { key: "nvapi-0123456789abcdefgh234", visible: "nvapi-01", stemRe: /nvapi/i },
+    { key: "ghp_0123456789abcdefgh23456", visible: "ghp_01", stemRe: /ghp_/i },
+    { key: "github_pat_0123456789abcdefgh", visible: "github_pat_01", stemRe: /github/i },
+    { key: "xoxp-0123456789abcdefgh23456", visible: "xoxp-01", stemRe: /xoxp-/i },
+    { key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", visible: "eyJhbGciO", stemRe: /eyJhbGci/i },
+  ];
+  for (const { key, visible, stemRe } of cases) {
+    const keyStart = 2_000 - visible.length;
+    assert.equal(`${"x".repeat(keyStart - 1)} ${key}`.slice(keyStart, keyStart + visible.length), visible, "test fixture: cut leaves exactly the vulnerable fragment");
+    const body = `${"x".repeat(keyStart - 1)} ${key}${"y".repeat(60)}`;
+    const { fetch: f } = recordingFetch(() => new Response(body, { status: 401, headers: { "content-type": "text/plain" } }));
+    const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+    await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`must reject (${stemRe.source})`); },
+      (e: unknown) => {
+        const pe = e as ProviderError;
+        assert.ok(pe instanceof ProviderError, `ProviderError (${stemRe.source})`);
+        assert.equal(pe.kind, "auth", `classification preserved (${stemRe.source})`);
+        assert.doesNotMatch(pe.message, RegExp(key), `full key not echoed (${stemRe.source})`);
+        assert.doesNotMatch(pe.message, stemRe, `no stem fragment leaked (${stemRe.source})`);
+        assert.match(pe.message, /\[redacted\]/);
+      },
+    );
+  }
+
+  // sanity: a fully visible key (well inside the cap) was already safe
+  const { fetch: f2 } = recordingFetch(() => new Response("denied: sk-or-v1-0123456789abcdefgh later", { status: 401, headers: { "content-type": "text/plain" } }));
+  const t2 = new HttpTransport({ ...TPROVIDER, fetchImpl: f2 });
+  await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      const pe = e as ProviderError;
+      assert.match(pe.message, /\[redacted\]/, "fully visible key already masked before the cut");
+      assert.doesNotMatch(pe.message, /0123456789/, "no key chars at all");
+      assert.equal(pe.kind, "auth");
+    },
+  );
+});
+
+test("R2: 400-probe excerpt masks a secret straddling its 300-byte boundary", async () => {
+  const key = "sk-or-v1-0123456789abcdefgh";
+  // visible = "sk-or-v1-" (9 chars; 6 after the sk- stem) → redact alone
+  // misses it; key starts at char 291, so the 300-byte cap cuts inside it
+  const body = `${"x".repeat(290)} ${key}${"y".repeat(60)}`;
+  const { fetch: f } = recordingFetch(() => new Response(body, { status: 400, headers: { "content-type": "text/plain" } }));
+  const t = new HttpTransport({ ...TPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      const pe = e as ProviderError;
+      assert.doesNotMatch(pe.message, /sk-or/i, "no stem fragment leaked through the probe path");
+      assert.doesNotMatch(pe.message, RegExp(key));
+      assert.match(pe.message, /\[redacted\]/);
+    },
+  );
+});
+
+test("R2: malformed non-streaming JSON body redacts BEFORE the 160-char cut", async () => {
+  // the full key sits inside the first 160 chars: plain redact() masks it in
+  // full BEFORE the message cap ever cuts — no fragment can exist at the cut
+  const raw = `{"error":"unauthorized: ${"x".repeat(127)} sk-or-v1-0123456789abcdefgh`;
+  const { fetch: f } = recordingFetch(() => new Response(raw, { status: 200, headers: { "content-type": "application/json" } }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      const pe = e as ProviderError;
+      assert.equal(pe.kind, "protocol");
+      assert.doesNotMatch(pe.message, /sk-or/i, "full key redacted before being cut by the message cap");
+      assert.doesNotMatch(pe.message, RegExp("0123456789"));
+      assert.match(pe.message, /redact/i, "redaction marker (possibly cut) still visible");
+    },
+  );
+});
+
+test("R2: malformed SSE data line redacts before its 160-char cut, incl. a partial token at EOF", async () => {
+  const key = "sk-or-v1-0123456789abcdefgh";
+  // terminated line whose FULL key is inside the payload: redact-first masks
+  // it, so the 160-char cut can no longer fragment it
+  const { fetch: f1 } = recordingFetch(() => sseResponseBody([`data: {"broken json ${"x".repeat(120)} ${key}"}\n\n`]));
+  const t1 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f1 });
+  await t1.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      const pe = e as ProviderError;
+      assert.equal(pe.kind, "protocol");
+      assert.doesNotMatch(pe.message, /sk-or/i);
+      assert.doesNotMatch(pe.message, RegExp("0123456789"));
+    },
+  );
+  // unterminated residual at EOF whose trailing token runs only 7 chars past
+  // the stem: plain redact() misses it (needs ≥8) and the message cut could
+  // fragment it — the tail scrub must catch the straddling piece
+  const { fetch: f2 } = recordingFetch(() => sseResponseBody([`data: {"c":"${"x".repeat(149)} sk-or-v1-0`]));
+  const t2 = new HttpTransport({ ...ORPROVIDER, fetchImpl: f2 });
+  await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => {
+      const pe = e as ProviderError;
+      assert.doesNotMatch(pe.message, /or-v1/i, "truncated-tail stem fragment masked");
+      assert.match(pe.message, /truncated/, "160-char cut honest suffix present");
+    },
+  );
+});
+
+test("R2: redactTruncatedTail helper semantics (direct unit)", () => {
+  assert.equal(redactTruncatedTail("boom @sk-or-v1-0"), "boom @[redacted]", "trailing stem fragment masked including the stem");
+  // glued stem fragment (boundary-agnostic post-audit fix)
+  assert.match(redactTruncatedTail("echo xsk-or-v1-0"), /x\[redacted\]/, "glued stem caught at the tail");
+  // full glued token is masked by plain redact() before the tail pass
+  assert.match(redactTruncatedTail("word sk-gn-Kort12345 end"), /\[redacted\]/);
+  // mid-body short fragment is NOT a token shape: untouched by design
+  const untouched = "run: sk-abc;x then tail plain text";
+  assert.equal(redactTruncatedTail(untouched), untouched, "mid-body non-token fragments unchanged");
+  // bearer + partial token (≥8 chars after "Bearer "): plain redact() already
+  // covers it; the helper must leave that masking intact
+  assert.match(redactTruncatedTail("denied Bearer sk-or-v1-012"), /Bearer \[redacted\]/);
+  // key: value tail
+  assert.match(redactTruncatedTail('config: api_key: "skf01digits"'), /api_key: .*redact/i);
+});
+
+test("R1: an unterminated oversized SSE line fails at the framing cap without materializing past cap+2 chunks", async () => {
+  for (const run of [1, 2]) {
+    const { res, consumed } = oversizedResponse({ status: 200, contentType: "text/event-stream", bodyBytes: 300_000, chunkBytes: 16_384 });
+    const { fetch: f } = recordingFetch(() => res);
+    const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+    const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`must reject (run ${run})`); },
+      (e: unknown) => e,
+    );
+    const pe = err as ProviderError;
+    assert.ok(pe instanceof ProviderError, `run ${run} rejects as ProviderError`);
+    assert.equal(pe.kind, "protocol", `run ${run}: deterministic classification`);
+    assert.match(pe.message, /SSE framing: a raw line exceeded the 131072 byte cap/, `run ${run}: deterministic message`);
+    assert.match(pe.message, /terminated or not/, `run ${run}: per-line contract stated in the error`);
+    assert.ok(consumed() <= 131_072 + 2 * 16_384, `run ${run}: pull-driven memory bounded (pulled ${consumed()} bytes)`);
+  }
+});
+
+test("R1: a giant single-chunk TERMINATED line is rejected before parsing (no JSON.parse of 200 KB)", async () => {
+  // residual-cap accounting cannot see this variant: the whole line —
+  // delimiter included — arrives inside ONE oversized chunk, so the length
+  // check must live where the line is drained (before processLine)
+  const giant = `data: {"padding":"${"x".repeat(190_000)}"}\n\n`;
+  const assertCap = async (label: string, fetchImpl: typeof fetch): Promise<void> => {
+    const t = new HttpTransport({ ...ORPROVIDER, fetchImpl });
+    const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`${label}: must reject (old code processed the line)`); },
+      (e: unknown) => e,
+    );
+    const pe = err as ProviderError;
+    assert.ok(pe instanceof ProviderError, `${label}: ProviderError`);
+    assert.equal(pe.kind, "protocol", `${label}: deterministic classification`);
+    assert.match(pe.message, /SSE framing: a raw line exceeded the 131072 byte cap/, `${label}: per-line framing cap message`);
+  };
+  // variant A: valid JSON — previously parsed fine, so the rejection proves
+  // the pre-parse check; padding field is discarded by parsers BEFORE the fix
+  await assertCap("valid-json line", recordingFetch(() => new Response(new ReadableStream({
+    start(c) { c.enqueue(Buffer.from(giant)); c.close(); },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } })).fetch);
+  // variant B: multi-chunk accumulation of the same line (rejected at the
+  // residual check mid-accumulation, never materializing 190 KB)
+  await assertCap("accumulated unterminated line", recordingFetch(() => oversizedResponse({ status: 200, contentType: "text/event-stream", bodyBytes: 250_000, chunkBytes: 16_384 }).res).fetch);
+});
+
+test("R1: several complete lines inside one chunk still parse (normality preserved)", async () => {
+  const enc = new TextEncoder();
+  const one = sseEvent({ id: "m", choices: [{ index: 0, delta: { content: "hello " }, finish_reason: null }] });
+  const two = sseEvent({ id: "m", choices: [{ index: 0, delta: { content: "world" }, finish_reason: null }] });
+  const { fetch: f } = recordingFetch(() => new Response(new ReadableStream({
+    start(c) {
+      // three complete SSE lines in ONE chunk, then EOF
+      c.enqueue(enc.encode(one + two + DONE_MARKER));
+      c.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } }));
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }) as ChatReply;
+  assert.equal(rep.content, "hello world", "multi-line single chunk unaffected by the line cap");
+});
+
+test("R2: a secret GLUED to adjacent text is redacted — full key and straddling prefix (transport level)", async () => {
+  const gluedCases: { key: string }[] = [
+    { key: "sk-or-v1-0123456789abcdefgh" },
+    { key: "nvapi-0123456789abcdefgh234" },
+    { key: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" },
+  ];
+  for (const { key } of gluedCases) {
+    const tag = key.slice(0, 12);
+    // full glued key: token glued to a word char and fully inside the cap
+    const bodyFull = `denied key: word${key} word`;
+    const { fetch: f1 } = recordingFetch(() => new Response(bodyFull, { status: 401, headers: { "content-type": "text/plain" } }));
+    const t1 = new HttpTransport({ ...TPROVIDER, fetchImpl: f1 });
+    await t1.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`must reject (glued full ${tag}…)`); },
+      (e: unknown) => {
+        const pe = e as ProviderError;
+        assert.equal(pe.kind, "auth", `classification preserved (glued full ${tag}…)`);
+        assert.doesNotMatch(pe.message, RegExp(key), `full glued key not echoed (${tag}…)`);
+        assert.match(pe.message, /\[redacted\]/);
+      },
+    );
+    // straddling glued key: the 2 KB cut leaves the stem glued to a word
+    // char with <8 chars after it — escaped BOTH redact() and the scrub
+    // before the post-audit boundary-agnostic fix
+    const keyStart = 2_000 - 9;
+    const bodyCut = `${"w".repeat(keyStart)}${key}${"y".repeat(60)}`;
+    assert.equal(bodyCut.slice(keyStart, keyStart + 9), key.slice(0, 9), `fixture: cut leaves the glued vulnerable prefix (${tag})`);
+    const { fetch: f2 } = recordingFetch(() => new Response(bodyCut, { status: 401, headers: { "content-type": "text/plain" } }));
+    const t2 = new HttpTransport({ ...TPROVIDER, fetchImpl: f2 });
+    await t2.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+      () => { throw new Error(`must reject (glued straddling ${tag}…)`); },
+      (e: unknown) => {
+        const pe = e as ProviderError;
+        assert.doesNotMatch(pe.message, RegExp(key), `straddling glued key not echoed (${tag}…)`);
+        assert.match(pe.message, /\[redacted\]/, `scrub caught the glued fragment (${tag}…)`);
+        assert.equal(pe.kind, "auth");
+      },
+    );
+  }
 });

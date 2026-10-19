@@ -27,7 +27,7 @@ export interface RuntimeOptions {
   selection?: string;
 }
 
-export type KnownSelection = "opencode" | "nvidia-direct";
+export type KnownSelection = "opencode" | "nvidia-direct" | "openrouter-direct";
 
 /**
  * Resolve a selection string (flag/env value) to the known set. Unknown
@@ -38,7 +38,8 @@ export function normalizeProviderSelection(raw: string | undefined | null): Know
   const v = String(raw ?? "opencode").trim().toLowerCase();
   if (v === "" || v === "opencode" || v === "default") return "opencode";
   if (v === "nvidia-direct" || v === "nvidia" || v === "nvidia_direct") return "nvidia-direct";
-  throw new Error(`unknown provider selection "${String(raw)}" — valid: opencode | nvidia-direct`);
+  if (v === "openrouter-direct" || v === "openrouter" || v === "openrouter_direct") return "openrouter-direct";
+  throw new Error(`unknown provider selection "${String(raw)}" — valid: opencode | nvidia-direct | openrouter-direct`);
 }
 
 /**
@@ -57,6 +58,11 @@ export async function createRuntime(opts?: RuntimeOptions): Promise<Runtime> {
     const provider = await NVIDIAProvider.start();
     return { provider, endpoint: { url: NVIDIA_BASE_URL_SAFE } };
   }
+  if (selection === "openrouter-direct") {
+    const { OpenRouterProvider } = await import("./providers/openrouter.ts");
+    const provider = await OpenRouterProvider.start();
+    return { provider, endpoint: { url: OPENROUTER_BASE_URL_SAFE } };
+  }
   const { OpenCodeProvider: OC } = await import("./providers/opencode.ts");
   const provider = await OC.start();
   return { provider, endpoint: { url: provider.url } };
@@ -64,3 +70,6 @@ export async function createRuntime(opts?: RuntimeOptions): Promise<Runtime> {
 
 /** Neutral NVIDIA endpoint surfaced for diagnostics (contract stays opaque). */
 const NVIDIA_BASE_URL_SAFE = "https://integrate.api.nvidia.com/v1";
+
+/** Neutral OpenRouter endpoint surfaced for diagnostics (contract stays opaque). */
+const OPENROUTER_BASE_URL_SAFE = "https://openrouter.ai/api/v1";

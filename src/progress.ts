@@ -42,17 +42,48 @@ const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 
 /** Mask anything credential-shaped. Defence in depth: events never carry
- * secrets, but a provider error body could echo an Authorization header. */
+ * secrets, but a provider error body could echo an Authorization header.
+ * Stem rules (nvapi-/sk-/gh*_stem/github_pat_/xox-/eyJ) historically used
+ * \b before the stem; a secret glued to an adjacent word char (a gateway
+ * echoing "xsk-or-v1-…") then escaped BOTH redact() and the truncation-boundary
+ * scrub. Post-audit (2026-10-19) the \b is dropped on those stems: recognition
+ * is now boundary-agnostic. Over-masking cost is bounded on purpose — every
+ * rule still demands the stem plus ≥8 contiguous token chars (JWT ≥16), so a
+ * legit prose fragment at most loses ONE token-shaped substring (e.g.
+ * "task-01234567"); short non-token fragments like "task-02" stay visible. */
 export function redact(s: string): string {
   return s
     .replace(/(bearer\s+)[A-Za-z0-9._\-]{8,}/gi, "$1[redacted]")
-    .replace(/\bnvapi-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
-    .replace(/\bsk-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
-    .replace(/\b(sk|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_\-]{8,}/g, "[redacted]")
-    .replace(/\bgithub_pat_[A-Za-z0-9_]{8,}/g, "[redacted]")
-    .replace(/\bxox[baprs]-[A-Za-z0-9-]{8,}/g, "[redacted]")
-    .replace(/\beyJ[A-Za-z0-9._\-]{16,}/g, "[redacted]")
+    .replace(/nvapi-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
+    .replace(/sk-[A-Za-z0-9._\-]{8,}/g, "[redacted]")
+    .replace(/(sk|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_\-]{8,}/g, "[redacted]")
+    .replace(/github_pat_[A-Za-z0-9_]{8,}/g, "[redacted]")
+    .replace(/xox[baprs]-[A-Za-z0-9-]{8,}/g, "[redacted]")
+    .replace(/eyJ[A-Za-z0-9._\-]{16,}/g, "[redacted]")
     .replace(/((?:api[_-]?key|token|secret|password)\s*[:=]\s*)["']?[A-Za-z0-9._\-]{8,}/gi, "$1[redacted]");
+}
+
+/** R2 (truncation-boundary redaction): `redact()` needs ≥8 chars after a
+ * secret's stem to match, so a token that a SIZE CAP cut in the middle
+ * escapes it — a fragment like "sk-or-v1-" remains visible. Runs AFTER a
+ * bounded excerpt was produced: masks any string END that starts with one
+ * of the same redact()-recognized stems and runs to the end, however few
+ * chars follow (plus the "…(truncated)" suffix truncateBytes may append).
+ * Like redact() itself, the stem match is now boundary-agnostic, so a root
+ * glued to a neighbor word ("xsk-or-v1-0") is caught too. Mid-body short
+ * fragments are intentionally untouched: redact()'s ≥8-char rule already
+ * classifies them as not token-shaped. The guarantee covers redact()-
+ * RECOGNIZABLE secrets only (nvapi-/sk-/gh*_stem/github_pat_/xox-/eyJ/
+ * bearer/"key: value"); keys with no recognizable stem and cuts INSIDE the
+ * stem itself remain out of scope exactly as in redact() itself. */
+export function redactTruncatedTail(s: string): string {
+  const base = redact(s);
+  const re = /((?:nvapi-|bearer\s+|sk-|(?:sk|ghp|gho|ghu|ghs|ghr)_|github_pat_|xox[baprs]-|eyJ|(?:api[_-]?key|token|secret|password)\s*[:=]\s*["']?))[A-Za-z0-9._\-]*(?:…\(truncated\))?\s*$/i;
+  const m = base.match(re);
+  // mask the whole tail INCLUDING the stem: a stem fragment like "sk-or-v1-"
+  // is vendor-identifying material too (the audit probe flagged it); keeping
+  // "[redacted]" alone is enough for diagnostics
+  return m && m.index !== undefined ? `${base.slice(0, m.index)}[redacted]` : base;
 }
 
 function str(x: unknown): string | undefined {

@@ -46,6 +46,8 @@ export interface HttpRunnerSpec {
   toolExecutor?: ToolExecutor;
   /** Injectable fetch for offline tests. */
   fetchImpl?: typeof fetch;
+  /** Send stream_options.include_usage (nvidia: yes; openrouter: no). */
+  includeUsage?: boolean;
 }
 
 type RoundHandle = ReturnType<HttpTransport["open"]>;
@@ -93,6 +95,7 @@ export class HttpAgentRunner implements AgentRunner {
       baseUrl: spec.baseUrl,
       apiKey: spec.apiKey,
       fetchImpl: spec.fetchImpl,
+      includeUsage: spec.includeUsage,
     });
     this.messages.push({ role: "system", content: spec.systemPrompt ?? defaultSystemPrompt(spec) });
     if (spec.toolsEnabled) {
