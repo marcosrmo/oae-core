@@ -253,7 +253,7 @@ async function main(): Promise<number> {
     case "publish": {
       const remote = await checkRemote(configBase);
       console.log(`remote: ${remote.hasRemote ? remote.url : "none"}`);
-      const repoName = arg("--repo", argv) ?? "opencode-autonomous-engineering";
+      const repoName = arg("--repo", argv) ?? "oae-core";
       const st = await inspectGit(dir);
       const r = await publish(configBase, repoName, { createRepo: !remote.hasRemote, private: !flag("--public", argv) });
       console.log(r.pushed ? `pushed ${st.branch} → ${r.repoUrl}` : `publish failed: ${r.error}`);

@@ -3,27 +3,34 @@
 
 # OAE Core
 
-**AUTONOMOUS ENGINEERING ORCHESTRATOR**
+**ORCHESTRATED AUTONOMOUS ENGINEERING · HARNESS CLI DE ENGENHARIA AUTÔNOMA COM IA**
 
-**Mantendo o trabalho de engenharia avançando.**
+**Mantendo o trabalho de engenharia avançando.** — *Keeping engineering work moving forward.*
 
 ![Node](https://img.shields.io/badge/node-%E2%89%A524-3c873a?logo=nodedotjs&logoColor=white)
-![OpenCode](https://img.shields.io/badge/OpenCode-v2%20%C2%B7%20client%202.0.29-6b46c1)
-![Tests](https://img.shields.io/badge/tests-46%2F46-brightgreen)
+![OpenCode](https://img.shields.io/badge/motor_atual-OpenCode_v2_%C2%B7_client_2.0.29-6b46c1)
+![CLI](https://img.shields.io/badge/CLI-oae-2ea44f)
+![Tests](https://img.shields.io/badge/tests-64%2F64-brightgreen)
 ![Status](https://img.shields.io/badge/status-v0.1%20%C2%B7%20experimental-orange)
 
 </div>
 
-OAE Core é um **orquestrador de engenharia autônoma** construído sobre o serviço do
-**OpenCode v2**. Dada uma requisição de engenharia em linguagem natural, ele planeja,
-despacha sessões de agentes reais do OpenCode (coder + revisor independente somente
-leitura), executa os validadores do próprio projeto e faz commit em um branch isolado
-— tudo supervisionado por um watchdog determinístico com limites rígidos de tempo e
-de tentativas.
+**OAE Core — Orchestrated Autonomous Engineering** — é um **harness CLI de engenharia
+autônoma com IA**. Seu núcleo é uma camada de orquestração **independente do motor de
+agentes**: coordena planejamento, execução, revisão, validação, supervisão e
+rastreabilidade de missões de engenharia, com limites rígidos de tempo e tentativas.
 
-> **Dependência atual:** o OAE Core **não** executa modelos por conta própria. Toda a
-> inteligência vem de sessões do OpenCode; o OAE é a camada que sequencia, observa,
-> supervisiona e contém essas sessões.
+Os motores de agentes são integrados por **adaptadores**. O **primeiro (e único) motor
+integrado hoje é o OpenCode v2** (`@opencode/client@2.0.29`): adaptadores para outros
+motores são **planejados, não implementados**. Dada uma requisição de engenharia em
+linguagem natural, o OAE Core despacha sessões de agentes reais do OpenCode (coder +
+revisor independente somente leitura), executa os validadores do próprio projeto e faz
+commit em um branch isolado — tudo supervisionado por um watchdog determinístico.
+
+> **Onde vive a inteligência:** o núcleo do OAE Core **não** executa modelos por conta
+> própria — por arquitetura, não por limitação. Toda a inteligência vem das sessões do
+> motor integrado (hoje, OpenCode); o OAE é a camada que sequencia, observa, supervisiona
+> e contém essas sessões.
 
 ---
 
@@ -79,11 +86,14 @@ que existe hoje:
 | **OAE Guardian** — supervisão, diagnóstico, recuperação controlada | `supervisor.ts` (watchdog determinístico — não é um LLM) | **Implementado** |
 | **OAE Agents** — agentes especializados | prompts de coder/reviewer/planner + `skills/` (`autonomous-engineering`, `independent-review`, `blocked-task-recovery`) | **Parcial** — coder (`build`), revisor somente-leitura (`oae-reviewer`) e planner (`plan`) existem; perfis especializados (segurança, contexto, documentação) são **planejados, não implementados** |
 | **OAE Control Center** — dashboard, eventos, progresso, histórico | `dashboard.ts`, `viewmodel.ts`, `events.ts`, `history.ts` | **Implementado** (terminal; não há UI web) |
-| **OAE Connect** — integração com OpenCode / MCP / motores futuros | `opencode.ts`, `skills/oae/` | **Implementado apenas para o OpenCode v2** via `@opencode/client@2.0.29`; MCP e outros motores **não implementados** (decisão D10: sem MCP no núcleo) |
+| **OAE Connect** — integração com motores de agentes por adaptadores | `opencode.ts` (adaptador OpenCode v2), `skills/oae/` | **Implementado apenas o adaptador OpenCode v2** via `@opencode/client@2.0.29`; adaptadores para outros motores e MCP são **planejados, não implementados** (decisão D10: sem MCP no núcleo) |
 
 > Os nomes das camadas são uma organização conceitual. Não existem hoje serviços,
 > binários ou interfaces separados chamados "Guardian", "Control Center" ou "Connect" —
-> são módulos TypeScript dentro deste repositório.
+> são módulos TypeScript dentro deste repositório. O núcleo da orquestração (camada
+> "OAE Core") e o adaptador de motor (`opencode.ts`) estão separados no código: o
+> orquestrador conversa com o motor apenas pela interface `AgentRunner`/`Client`
+> (`opencode.ts`), que é o ponto de extensão para adaptadores futuros.
 
 ### Fluxo de execução
 
@@ -292,6 +302,10 @@ npm run typecheck          # tsc --noEmit
 npm test                   # suíte unitária determinística (sem provedores)
 ```
 
+> O nome técnico do pacote npm agora é **`oae-core`**. A renomeação do repositório
+> GitHub para `oae-core` é uma pendência declarada; a URL acima continua válida antes
+> e depois da renomeação (o GitHub redireciona automaticamente URLs antigas).
+
 Para rodar a CLI direto da fonte, sem instalar:
 
 ```pwsh
@@ -310,8 +324,13 @@ npm install -g .
 
 # ou a partir de um tarball (sem clonar)
 npm pack                                                    # gera o .tgz
-npm install -g opencode-autonomous-engineering-0.1.0.tgz
+npm install -g oae-core-0.1.0.tgz
 ```
+
+> **Transição de nome:** se você tinha instalado globalmente o pacote antigo
+> `opencode-autonomous-engineering`, desinstale-o antes (`npm uninstall -g
+> opencode-autonomous-engineering`) e instale a partir do novo tarball/clon — o comando
+> `oae` continua idêntico.
 
 Depois disso:
 
@@ -439,4 +458,4 @@ gerenciador de segredos.
 
 ---
 
-<sub>OAE Core · AUTONOMOUS ENGINEERING ORCHESTRATOR · construído sobre o OpenCode v2.0.29 · [docs](docs/)</sub>
+<sub>OAE Core · Orchestrated Autonomous Engineering · núcleo de orquestração independente, motor de agentes integrado: OpenCode v2.0.29 · [docs](docs/)</sub>

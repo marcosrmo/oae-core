@@ -1,7 +1,7 @@
 {
-  "name": "opencode-autonomous-engineering",
+  "name": "oae-core",
   "version": "0.1.0",
-  "description": "Reusable autonomous software engineering system built on the OpenCode v2 service API.",
+  "description": "OAE Core — Orchestrated Autonomous Engineering: an engine-agnostic harness CLI for AI-driven autonomous software engineering. First integrated engine: OpenCode v2.",
   "type": "module",
   "private": true,
   "engines": { "node": ">=24.0.0" },

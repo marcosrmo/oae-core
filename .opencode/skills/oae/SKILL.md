@@ -1,11 +1,15 @@
 ---
 name: OAE Mission Runner
-description: Launch and track OAE (OpenCode Autonomous Engineering) missions from inside an OpenCode session — start a run, poll status, read the evidence report, and respect the anti-recursion rules.
+description: Launch and track OAE Core (Orchestrated Autonomous Engineering) missions from inside an OpenCode session — start a run, poll status, read the evidence report, and respect the anti-recursion rules.
 ---
 
 # Running OAE missions from OpenCode
 
-OAE is the autonomous engineering orchestrator shipped with this repository.
+OAE Core (installed as the `oae` CLI) is the orchestrated autonomous engineering
+harness shipped with this repository: it owns planning, execution, review,
+validation, supervision and traceability. Agent intelligence is not built in —
+agent sessions currently run through its **integrated OpenCode v2 engine
+adapter** (the only engine adapter implemented; other engines remain planned).
 Given one engineering request, it plans, dispatches real OpenCode agent sessions
 (coder + independent read-only reviewer) through the running OpenCode service,
 runs the project's own validators, and commits on an isolated `oae/auto-*` git
