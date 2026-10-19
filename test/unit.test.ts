@@ -1234,6 +1234,9 @@ test("large requests still use the model planner", async () => {
   const dir = await makeProject();
   try {
     const config = fastRecovery(await loadConfig(dir));
+    // explicit model selection must reach the planner session as well (review
+    // finding F3): same contract propagation as coder/reviewer
+    config.model = { providerID: "nvidia", id: "z-ai/glm-5.3-flash" };
     const planJson = { summary: "model plan", tasks: [{ id: "t1", title: "x", instructions: "i", dependsOn: [], acceptance: ["a"] }], decisions: [] };
     const client = stubClient({
       active: async () => ({}) as Record<string, unknown>, // idle on first poll -> completed
@@ -1241,12 +1244,21 @@ test("large requests still use the model planner", async () => {
         { type: "assistant", content: [{ type: "text", text: JSON.stringify(planJson) }] },
       ] }),
     });
+    const sessions: Array<Record<string, unknown>> = [];
     const big = "restructure the authentication module across src/auth/*.ts ".repeat(10); // > 200 chars
     const plan = await makePlan({
       id: "opencode",
-      createSession: (opts) => OpenCodeRunner.start(client, opts),
+      createSession: (opts) => {
+        sessions.push({ agent: opts.agent, model: opts.model, directory: opts.directory, title: opts.title });
+        return OpenCodeRunner.start(client, opts);
+      },
     }, config, big);
     assert.equal(plan.summary, "model plan", "model-assisted plan is used for large requests");
+    const s = sessions[0] ?? {};
+    assert.deepEqual(s.model, { providerID: "nvidia", id: "z-ai/glm-5.3-flash" },
+      "configured model reaches the planner session verbatim");
+    assert.equal(s.agent, config.plannerAgent);
+    assert.equal(s.directory, dir);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -1272,6 +1284,19 @@ test("unparseable review with passing validators is re-asked, not re-coded (run-
     assert.equal(task.attempts.filter((a) => a.kind === "review").length, 2, "one review + one re-ask");
     assert.ok(reviewers[1]!.prompts[0].includes("ENTIRE reply must be exactly ONE JSON object"), "re-ask carries the format reminder");
     assert.ok(state.decisions.some((d) => d.text.includes("re-asking the reviewer")), "re-ask decision recorded");
+    // F6: the rollout distinguishes a substantive approval from an unparseable
+    // reply WITHOUT mislabeling either — review attempt outcomes follow the
+    // state.json vocabulary (approved/rejected) and `verdict` carries the nuance
+    const slog = new SessionLog(dir);
+    const revAttempts = task.attempts.filter((a) => a.kind === "review");
+    const firstRev = await slog.read(`task-1-a${revAttempts[0]!.id}`);
+    const reAskRev = await slog.read(`task-1-a${revAttempts[1]!.id}`);
+    const firstOutcome = firstRev.find((e) => e.kind === "result")! as unknown as Record<string, unknown>;
+    const secondOutcome = reAskRev.find((e) => e.kind === "result")! as unknown as Record<string, unknown>;
+    assert.equal(firstOutcome.outcome, "rejected", "unparseable review is NOT labeled approved/failed");
+    assert.equal(firstOutcome.verdict, "unparseable", "unparseable-ness is explicit in `verdict`");
+    assert.equal(secondOutcome.outcome, "approved");
+    assert.equal(secondOutcome.verdict, "approve");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -2037,11 +2062,20 @@ test("orchestrator + session log: real attempts record dispatch/result into .oae
     const files = (await readdir(sessDir)).sort();
     assert.ok(files.some((f) => f.startsWith("task-1-a1")), "coder attempt logged");
     assert.ok(files.some((f) => f.startsWith("task-1-a2")), "review attempt logged");
-    const codeEvents = await new SessionLog(dir).read("task-1-a1");
+    const slog = new SessionLog(dir);
+    const codeEvents = await slog.read("task-1-a1");
     assert.equal(codeEvents[0]?.v, 1);
     assert.equal(codeEvents[0]?.kind, "dispatch");
     assert.equal(codeEvents[0]?.phase, "code");
     assert.equal(codeEvents[0]?.sessionId, "s-code");
+    // F6: rollout outcome uses the canonical attempt vocabulary; rawOutcome
+    // preserves the runner-contract distinction
+    const codeResult = codeEvents.find((e) => e.kind === "result");
+    assert.equal(codeResult?.outcome, "completed", "canonical code outcome");
+    assert.equal((codeResult as Record<string, unknown> | undefined)?.rawOutcome, "completed");
+    const revResult = (await slog.read("task-1-a2")).find((e) => e.kind === "result");
+    assert.equal(revResult?.outcome, "approved", "canonical review outcome matches state.json");
+    assert.equal((revResult as Record<string, unknown> | undefined)?.verdict, "approve");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -2108,5 +2142,36 @@ test("orchestrator: dispatch without provider and without runnerFactory fails ho
     assert.notEqual(state.status, "done");
     assert.notEqual(state.tasks[0].status, "done");
     assert.ok(["blocked", "failed", "cancelled"].includes(state.tasks[0].status), `status: ${state.tasks[0].status}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("session rollout: torn tail is fenced on the next append — later records survive the torn one (F2)", async () => {
+  const dir = await makeProject();
+  try {
+    const log = new SessionLog(dir);
+    assert.equal(await log.append("task-2-a1", "dispatch", { sessionId: "ses_ok" }), true);
+    // crash mid-write: torn JSON line, no trailing newline
+    const file = join(dir, ".oae", "sessions", "task-2-a1.jsonl");
+    await rawAppend(file, '{"at":"2026-10-19T00');
+    // the NEXT appends must not concatenate to the torn line
+    assert.equal(await log.append("task-2-a1", "result", { outcome: "completed" }), true);
+    assert.equal(await log.append("task-2-a1", "interrupt", { detail: "reset" }), true);
+    // tolerant read: each complete record parses independently; exactly ONE
+    // line (the torn one) is dropped
+    const events = await log.read("task-2-a1");
+    assert.deepEqual(events.map((e) => e.kind), ["dispatch", "result", "interrupt"]);
+    assert.equal((events[1] as Record<string, unknown>).outcome, "completed");
+    // byte-level proof of append-only fencing:
+    //   line 0 = the pre-crash "dispatch" record;
+    //   line 1 = the untouched torn bytes, now newline-terminated (fenced);
+    //   lines 2-3 = the new records on their OWN lines, each JSON-parseable;
+    //   no byte was rewritten and no later record was glued to the torn line
+    const raw = await readFile(file, "utf8");
+    const lines = raw.split("\n");
+    assert.equal(JSON.parse(lines[0]!).kind, "dispatch", "first record intact");
+    assert.equal(lines[1]?.startsWith('{"at":"2026-10-19T00'), true, "torn line untouched (append-only invariant)");
+    assert.equal(lines[1]?.includes('"kind":"result"'), false, "no later record was glued into the torn line");
+    assert.equal(JSON.parse(lines[2]!).kind, "result", "result record is an independent parseable line");
+    assert.equal(JSON.parse(lines[3]!).kind, "interrupt");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

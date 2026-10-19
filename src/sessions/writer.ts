@@ -44,12 +44,25 @@ export class SessionLog {
    * Append one event for an attempt. Returns true when persisted, false when
    * recording failed (never throws; the caller decides what visibility a
    * dropped observability record deserves).
+   *
+   * Torn tail safety (review finding F2): if the file ends mid-JSON (crash
+   * during a previous write), a bare append would CONCATENATE the new record
+   * to the torn line — both would be lost together. The tail is terminated
+   * with one "\n" first, so the torn line stays fenced (and the tolerant
+   * reader keeps dropping it) while every later record stays independently
+   * parseable. Append-only invariant: no byte ever rewritten, only "\n"
+   * delimiter bytes added after an incomplete last line.
    */
   async append(attemptId: string, kind: string, data: Record<string, unknown> = {}): Promise<boolean> {
     const rec: SessionEvent = { ...data, at: nowISO(), v: 1, kind };
     try {
       await mkdir(this.dir(), { recursive: true });
-      await appendFile(join(this.dir(), safeKey(attemptId) + ".jsonl"), JSON.stringify(rec) + "\n", "utf8");
+      const file = join(this.dir(), safeKey(attemptId) + ".jsonl");
+      try {
+        const tail = await readFile(file, "utf8");
+        if (tail.length > 0 && !tail.endsWith("\n")) await appendFile(file, "\n", "utf8");
+      } catch { /* new file: nothing delimitable */ }
+      await appendFile(file, JSON.stringify(rec) + "\n", "utf8");
       return true;
     } catch {
       return false; // best-effort observability: never breaks the run

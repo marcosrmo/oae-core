@@ -5,13 +5,18 @@
  * here — nothing else in the codebase imports adapter SDKs.
  */
 import type { Provider } from "./providers/contract.ts";
-import type { Endpoint } from "@opencode/client/service";
 import { OpenCodeProvider } from "./providers/opencode.ts";
+
+/** Runtime-neutral service endpoint. Adapter SDK types may NOT cross this
+ * boundary (review finding F1); adapters map their native endpoint internally. */
+export interface RuntimeEndpoint {
+  url: string;
+}
 
 export interface Runtime {
   provider: Provider;
   /** Service endpoint (diagnostics only; the contract stays opaque). */
-  endpoint?: Endpoint;
+  endpoint?: RuntimeEndpoint;
 }
 
 /**
@@ -21,5 +26,5 @@ export interface Runtime {
  */
 export async function createRuntime(): Promise<Runtime> {
   const provider = await OpenCodeProvider.start();
-  return { provider };
+  return { provider, endpoint: { url: provider.url } };
 }

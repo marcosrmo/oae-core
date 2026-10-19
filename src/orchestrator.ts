@@ -330,7 +330,12 @@ export class Orchestrator {
     const revUsage = await this.collectUsage(rev.runner);
     await this.recordSession(revAttempt, task.id, "result", {
       taskId: task.id, attemptId: revAttempt.id, phase: "review",
-      outcome: verdict?.verdict ?? "unparseable", runtime: rev.runner.runtime, sessionId: rev.runner.sessionId,
+      // canonical attempt vocabulary identical to finishAttempt; the `verdict`
+      // field differentiates a substantive rejection (approve/reject parsed)
+      // from an unparseable reply — information NOT collapsed into `outcome`
+      outcome: verdict?.verdict === "approve" ? "approved" : "rejected",
+      verdict: verdict?.verdict ?? "unparseable",
+      runtime: rev.runner.runtime, sessionId: rev.runner.sessionId,
       output: truncate(revRes.output, 2000),
       tokens: revUsage ?? null,
     });
@@ -381,9 +386,14 @@ export class Orchestrator {
         this.emit("agent_progress", { taskId: task.id, attemptId: attempt.id, phase: "code", signalKind: s.kind, detail: s.detail });
       });
       const usage = await this.collectUsage(runner);
+      const normalizedOutcome = res.outcome === "completed" ? "completed" : "interrupted";
       await this.recordSession(attempt, task.id, "result", {
         taskId: task.id, attemptId: attempt.id, phase: "code",
-        outcome: res.outcome, runtime: runner.runtime, sessionId: runner.sessionId,
+        // canonical attempt vocabulary (matches state.json's finishAttempt);
+        // rawOutcome keeps the runner-contract distinction (failed vs interrupted)
+        outcome: normalizedOutcome,
+        rawOutcome: res.outcome,
+        runtime: runner.runtime, sessionId: runner.sessionId,
         output: truncate(res.output, 2000),
         tokens: usage ?? null,
       });

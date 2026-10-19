@@ -16,6 +16,7 @@
  * templates (see dashboard.ts).
  */
 import { nowISO } from "./util.ts";
+import { classifyProviderError } from "./contracts.ts";
 
 /** Event kinds written by OAE itself (subset of `Store.event` kinds). */
 export const EventKind = {
@@ -50,6 +51,11 @@ export interface OaeEvent {
  * Classify a provider/runtime failure surfaced by a runner outcome.
  * The service reports e.g. "Provider request failed with HTTP 429: {...}".
  * Recognition is by stable markers in the message, never by assumptions.
+ *
+ * Single classification engine (review finding F5): the kind/httpStatus
+ * rules live ONLY in contracts.ts (classifyProviderError); this function is
+ * a compatibility FACET of that engine, preserving the coarse provider/runner
+ * source distinction used by the orchestrator and the availability gates.
  */
 export interface ProviderFailure {
   kind: "provider" | "runner";
@@ -59,13 +65,12 @@ export interface ProviderFailure {
 }
 
 export function classifyProviderFailure(raw: string): ProviderFailure {
-  const msg = (raw ?? "").trim();
-  const m = msg.match(/HTTP\s+(\d{3})/i);
-  if (msg.startsWith("provider/run error:") || msg.startsWith("runner error:")) {
-    const kind = msg.startsWith("provider/run error:") ? "provider" : "runner";
-    return { kind, httpStatus: m ? Number(m[1]) : undefined, message: msg };
-  }
-  return { kind: "provider", httpStatus: m ? Number(m[1]) : undefined, message: msg };
+  const msg = String(raw ?? "").trim();
+  const engine = classifyProviderError(msg, "provider" as const);
+  // source facet: runner-marker wins, everything else (unmarked included)
+  // stays provider — exactly the historical precedence
+  const kind: ProviderFailure["kind"] = msg.startsWith("runner error:") ? "runner" : "provider";
+  return { kind, httpStatus: engine.httpStatus, message: msg };
 }
 
 /** True when a failure means "the provider never delivered compute" — e.g.

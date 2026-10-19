@@ -647,6 +647,11 @@ export class OpenCodeProvider implements Provider {
     return OpenCodeRunner.start(this.client, opts);
   }
 
+  /** Neutral endpoint URL (runtime.ts consumes this; SDK types stay internal). */
+  get url(): string {
+    return this.endpoint.url;
+  }
+
   async healthCheck(): Promise<{ ok: boolean; detail?: string }> {
     try {
       const res = await fetch(new URL("api/health", this.endpoint.url));
