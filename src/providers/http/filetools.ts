@@ -20,7 +20,7 @@
  * execute() NEVER throws — every failure is a plain-text tool result so the
  * model can correct course; a broken tool must never crash the session.
  */
-import { lstat, mkdir, open, opendir, realpath, writeFile } from "node:fs/promises";
+import { constants as FS_CONSTANTS, lstat, mkdir, open, opendir, realpath } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import type { Dirent, Stats } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
@@ -258,12 +258,44 @@ export class FileToolSet {
     }
   }
 
+  /** F8 mitigation (Etapa 3): resolveTarget's lstat→write gap is closed at
+   * the LEAF with open(O_NOFOLLOW) — a PATH that turns into a symlink
+   * BETWEEN the check and the open fails with ELOOP instead of being
+   * followed out of the root. Legit creation AND overwrite of regular files
+   * are preserved (O_WRONLY|O_CREAT|O_TRUNC; same visible behavior and
+   * message as the former fs/writeFile path). Resolution/containment checks
+   * are untouched. Unresolved by design: directory-component swaps,
+   * hardlinks and bind-mounts are invisible to realpath/no-follow flags —
+   * documented residual for the Onda 3 sandbox (docs/onda2-plan.md §9). */
   private async writeFile(rawPath: string, content: string): Promise<string> {
     if (content.length > FILE_TOOL_LIMITS.writeMaxChars) {
       throw new Error(`content exceeds the ${FILE_TOOL_LIMITS.writeMaxChars} char cap (${content.length})`);
     }
     const target = await this.resolveTarget(rawPath, true);
-    await writeFile(target, content, "utf8");
+    // secure final-component open: O_NOFOLLOW refuses a leaf that is (or just
+    // became) a symlink; ?? 0 keeps the flags valid on platforms that lack it
+    const flags = FS_CONSTANTS.O_WRONLY | FS_CONSTANTS.O_CREAT | FS_CONSTANTS.O_TRUNC | (FS_CONSTANTS.O_NOFOLLOW ?? 0);
+    let handle;
+    try {
+      handle = await open(target, flags, 0o666);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code === "ELOOP") {
+        throw new Error("refusing to write: target is a symlink (O_NOFOLLOW rejected the open; symlinks are not followed)");
+      }
+      throw e;
+    }
+    try {
+      // same observable result as fs/writeFile(..., "utf8"): file truncated
+      // by O_TRUNC before this, then the full content written from byte 0
+      // (multi-byte UTF-8 safe). fsPromises.writeFile internally RETRIED
+      // short writes; a single handle.write() must not be trusted with that
+      const buf = Buffer.from(content, "utf8");
+      await writeFully(handle, buf);
+    } finally {
+      // release the descriptor on every outcome; a close failure must never
+      // mask the original write error
+      await handle.close().catch(() => undefined);
+    }
     const rel = relative(await this.canonicalRoot(), target) || ".";
     return `written ${Buffer.byteLength(content, "utf8")} bytes to ${rel}`;
   }
@@ -310,6 +342,28 @@ export class FileToolSet {
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+/** R3 (auditoria técnica Etapa 3): full-write loop for the secured leaf
+ * handle. The former fsPromises.writeFile internally covered short writes;
+ * a single handle.write() does not, so a short write would have left a
+ * truncated file while the tool still reported the full count. This loop
+ * resumes from the bytes actually written and aborts with an explicit error
+ * when a write returns ZERO bytes (no progress possible on this descriptor)
+ * — it never reports bytes that were not written to the descriptor.
+ * Exported ONLY for deterministic tests with a fake FileHandle: partial
+ * writes, write failures and zero-progress are not injectable on a real
+ * regular file without a disproportional fs-injection layer. */
+export async function writeFully(handle: FileHandle, buf: Uint8Array): Promise<void> {
+  let written = 0;
+  while (written < buf.length) {
+    const chunk = buf.subarray(written);
+    const r = await handle.write(chunk, 0, chunk.byteLength);
+    if (r.bytesWritten <= 0) {
+      throw new Error(`write_file: write made no progress (${written}/${buf.length} bytes written)`);
+    }
+    written += r.bytesWritten;
+  }
 }
 
 async function safeLstat(p: string): Promise<Stats | null> {

@@ -11,12 +11,16 @@ fallback cobriu a pequena tarefa). Este documento fixa o desenho técnico
 para que a Onda 2 execute um provider por vez (NVIDIA primeiro), reutilizando
 a fronteira de contratos consolidada na Onda 1.
 
-Limites residuais documentados (auditoria 2026-10-19): F8 — TOCTOU lstat→write
-não é atômico; hardlinks e bind-mounts não são detectáveis pelo realpath
-(sandbox completo é Onda 3); um `open()` em FIFO não é cancelável pelo
+Limites residuais documentados (atualizados na Etapa 3, 2026-10-19): F8 — a
+janela TOCTOU lstat→write do componente FINAL foi fechada com
+`open(O_NOFOLLOW)` (§10, Lote A; evidência: testes de recusa + semântica de
+flag preservada); troca de componentes de DIRETÓRIO, hardlinks e bind-mounts
+continua indetectável por realpath ou por flags de `open` (sandbox completa é
+Onda 3 — não alegar resolução). Um `open()` em FIFO não é cancelável pelo
 AbortSignal no nível do SO, por isso o runner settle independentemente da
-tool (corrida de parada) e descarta resoluções tardias. F10 (pré-existente):
-`filesChanged` da tentativa inclui `.oae/`.
+tool (corrida de parada) e descarta resoluções tardias. F10 — RESOLVIDO na
+Etapa 3: `filesChanged` agora exclui `.oae/` e `.opencode/` por SEGMENTO de
+caminho e marca truncamento explicitamente (§10, Lote D).
 
 Restrição arquitetural no runner direto (auditoria 2026-10-19, achado A2):
 no pump do `HttpAgentRunner`, o trecho entre a troca de `pendingUser`
@@ -29,10 +33,11 @@ e a nota de follow-up descartado (`droppedFollowUpsNote`): se um await
 intercalar a troca, um follow-up poderia ficar em pendingUser já trocado
 quando o terminal for `completed` — o único call site de settle sem nota.
 Nenhum comportamento de execução foi alterado por esta restrição; ela é uma
-trava arquitetural contra refactors futuros. Achados residuais da mesma auditoria não
-corrigidos aqui (fora do escopo desta tarefa): A1 (readExcerpt/readAll
-materializam o corpo inteiro antes do cap), A3 (contagem ±1 char em corte
-mid-codepoint, cosmético) e A4 (cap de slots ausente no parse non-streaming).
+trava arquitetural contra refactors futuros. Achados da mesma auditoria:
+A1 e A4 foram corrigidos na Etapa 2 (§9); A3 (contagem ±1 char em corte
+mid-codepoint, cosmético) segue em aberto — a Etapa 3 não alterou esse
+comportamento; aceite ou correção é decisão do dono (sem alegação de
+resolução).
 
 Nota de adaptação (plano → código real): a tabela HTTP canônica foi consolidada
 em `contracts.ts` (`classifyHttpFailure`: 401/403→auth, 429→rateLimit,
@@ -57,7 +62,7 @@ Novos módulos (etapa 1 — implementados):
 - `src/providers/http/runner.ts` — `HttpAgentRunner implements AgentRunner`: array de mensagens como sessão; primeiro prompt despachado em `begin()` (falha de dispatch rejeita na criação — paridade com OpenCodeRunner); loop de tool-calls por rodadas; usage agregado; ordem de settle única.
 - `src/providers/http/filetools.ts` — FileToolSet (read_file/write_file/list_dir) com confinamento canônico à raiz, proudimentos estritos, negação de symlinks, `.oae/.opencode` somente leitura e caps de E/S.
 - `src/providers/nvidia.ts` — adaptador NVIDIA fino (`nvidia-direct`): `OAE_NVIDIA_API_KEY` do ambiente (erro claro sem segredo quando ausente), healthCheck barato sem chamada de modelo.
-- `src/openrouter.ts` — planejado para etapa posterior sobre o mesmo transporte.
+- `src/providers/openrouter.ts` — etapa 2, IMPLEMENTADO (§9) sobre o mesmo transporte (`HttpTransport`/`HttpAgentRunner`/`FileToolSet`).
 
 ## 2. Autenticação (sem revelar nem modificar segredos)
 
@@ -160,21 +165,23 @@ O OpenCode segue disponível como adaptador independente — nada foi removido.
    `includeUsage: false` (flag nova em `TransportConfig`); nvidia-direct
    continua enviando (teste "pins" fixa a divergência).
 
-### A1 — limites de memória de corpos HTTP (resolvido, com residual de cancelamento)
+### A1 — limites de memória de corpos HTTP (resolvido; cancelamento de readers fechado na Etapa 3)
 `readExcerpt`/`readAll` (`res.text()` ⇒ materialização integral) foram
-substituídos por `readBounded(res, cap, signal?)`: leitura incremental por
-chunks via `res.body.getReader()`, memória limitada ao cap (+ débito de um
-chunk: um chunk é decodificado ANTES do check e a fila faz 1 prefetch —
-se um único chunk de fio for gigante, ele é materializado inteiro antes do
-break; chunks reais de vendors são pequenos). Contagem de bytes consumidos.
+substituídos por `readBounded(res, cap, signal?, cancelWhenDone?)`: leitura
+incremental por chunks via `res.body.getReader()`, memória limitada ao cap
+(+ débito de um chunk: um chunk é decodificado ANTES do check e a fila faz
+1 prefetch — se um único chunk de fio for gigante, ele é materializado
+inteiro antes do break; chunks reais de vendors são pequenos). Contagem de
+bytes consumidos.
 - **Corpo de erro**: lê apenas `errorExcerptBytes` (2 KB) e PARA de ler;
   reporta "…(body truncated, >2000 bytes — further data not read)".
-  **Cancelamento do reader NÃO é feito aqui**: é responsabilidade do
-  chamador — os rounds consumidos via `open().consume()` cancelam o reader
-  no `finally`, mas os caminhos de corpo de erro e de 400-probe terminam a
-  leitura sem `reader.cancel()` explícito e devolvem a conexão à camada de
-  fetch (residual de limpeza/higiene de conexão, NÃO de memória — avaliar
-  cancelamento nesses caminhos quando a Onda 3 revisar o transport).
+  **Cancelamento (Etapa 3)**: esses dois caminhos (corpo de erro e
+  400-probe) passam `cancelWhenDone: true` — após o trecho coletado, o
+  `reader.cancel()` libera a conexão do corpo; falhas de cancel são
+  engolidas e nunca mascaram o erro/trecho original (testes com streams
+  instrumentados, inclusive cancel hostil que lança). O caminho de sucesso
+  continua SEM cancel duplo aqui: o `finally` de `consume()` segue como dono
+  do reader (semântica F4).
 - **Corpo de sucesso non-streaming**: cap novo `successBodyBytes: 4_000_000`
   (4 MiB — folgado vs. `roundContentBytes` 1 MiB); excedido → erro de
   protocolo controlado sem materializar o resto
@@ -219,8 +226,18 @@ Onda 1 (dir isolado, cap 900 s, artefatos em `.oae/`) quando autorizado.
 
 ### Riscos residuais (não resolvidos, sem alegação de oposição)
 - **A3**: ±1 char na contagem UTF-8 em corte mid-codepoint (cosmético).
-- **F8**: TOCTOU lstat→write, hardlinks/bind-mounts (sandbox é Onda 3).
-- **F10**: `filesChanged` inclui `.oae/` (pré-existente).
+- **F8 — MITIGADO na folha (Etapa 3, §10/Lote A)**: `write_file` abre o
+  destino com `O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW` — um leaf que vire
+  symlink entre a checagem e o `open` falha com `ELOOP` (mensagem honesta)
+  em vez de ser seguido; criação e sobrescrita legítimas preservadas.
+  Residuais NÃO resolvidos (não alegar o contrário): troca de componentes
+  de diretório, hardlinks e bind-mounts → sandbox da Onda 3.
+- **F10 — CORRIGIDO e testado (Etapa 3, §10/Lote D)**: filtro por segmento
+  para `.oae/` e `.opencode/` (decisão registrada: ambos excluídos como
+  artefatos do harness; arquivos de projeto que apenas começam com ".oae"
+  continuam legítimos), strip correta do formato porcelain " M path" e
+  marcador explícito de truncamento com contagem omitida (contrato
+  `filesChanged: string[]` preservado).
 - **R1 — buffer de linha do path SSE SEM limite — CORRIGIDO e testado
   (fechamento pós-auditoria: a conferência passa a valer POR LINHA,
   terminada ou não)**: em `parseSseBody`, o residual que espera um `\n`
@@ -308,14 +325,163 @@ Onda 1 (dir isolado, cap 900 s, artefatos em `.oae/`) quando autorizado.
   no 400-probe. Limite de evidência: comprovado com mocks `ReadableStream`;
   o comportamento em fetch real (undici) é inferido estaticamente — sem
   chamada de rede executada.
-- **Observações (sem ação nesta etapa)**: compatibilidade de parâmetros
+- **Observações (atualizadas pela Etapa 3)**: compatibilidade de parâmetros
   varia por modelo no OpenRouter (ex.: nem todo modelo suporta tool
-  calling) — sem gate de capability no cliente; um modelo sem tools que
-  retorna tool_calls malformadas falha honestamente como erro de protocolo.
-  Ao usar `openrouter-direct` com o coder, escolher modelo com suporte a
-  tool calling documentado. Erro 402 (créditos) classifica `protocol` pela
+  calling). **Decisão Etapa 3 (C3): sem catálogo de modelos nem gate
+  rígido** (informações de capability não verificadoras localmente) — a
+  Etapa 3 manteve o erro explícito e recuperável (protocol error via
+  `classifyProviderError`) como comportamento local determinístico; ao usar
+  `openrouter-direct` com o coder, escolher modelo com suporte a tool
+  calling documentado. Erro 402 (créditos) classifica `protocol` pela
   tabela canônica (mensagem traz "Payment Required" — diagnóstico claro;
-  mudança de tabela não escopo desta etapa). `healthCheck` usa fetch global
-  (não injetado), padrão já adotado pelo nvidia-direct. O adaptador
-  OpenCode mantém `res.text()/json()` ilimitados (serviço local, fora do
-  escopo do transporte direto).
+  mudança de tabela não escopo desta etapa). **Etapa 3 (C1)**:
+  `healthCheck` dos providers diretos (NVIDIA e OpenRouter) aceita
+  `fetchImpl` opcional nas opções de `start()` — default segue o fetch
+  global, chamadores existentes inalterados; `detail` continua trazendo
+  apenas status/erro de rede, nunca headers/chave. **Etapa 3 (C2)**: o shim
+  de prompt do adaptador OpenCode lê o corpo de erro via `readBounded`
+  (300 B) em vez de `res.text()` ilimitado; o `res.json()` do caminho de
+  SUCESSO segue como residual documentado (serviço local confiável,
+  leitura limitada incompatível com o contrato de retorno estruturado).
+
+---
+
+## 10. Etapa 3 — Melhorias reais (implementadas 2026-10-19, sem commit/push)
+
+Alterações de código com testes de regressão; documentação escrita APÓS o
+código e a suíte. Suíte após a etapa e as correções da auditoria
+pós-implementação (R1–R4): **161 testes — 159 pass, 0 fail, 2 skipped
+(opt-ins: runtime real OpenCode `OAE_RUNTIME_TEST=1` e real OpenRouter
+`OAE_OPENROUTER_REAL=1` — NÃO executados, como antes)**; base de
+comparação: 142/140/0/2 na publicação `f51e10f`; intermediário da Etapa 3
+antes das correções: 156/154/0/2 (+14). Δ contra a base: **+19** (14
+originais + 1 do R1 [status `T` do porcelain] + 4 do R3 [cenários
+scriptados de `writeFully`]); o único teste RENOMEADO é o de cancel duplo
+do Lote B — fortalecido com contador de `cancel()` (R4), não teve
+expectativa enfraquecida. Nenhum teste foi removido.
+Validação final: `npm run typecheck` (0 erros), suíte completa (exit 0),
+`npm run build` (exit 0), `git diff --check` (limpo).
+
+### Lote A — F8: abertura segura do componente final de escrita
+`FileToolSet.writeFile` (`src/providers/http/filetools.ts`) não usa mais
+`fsPromises.writeFile` (que poderia seguir um symlink instalado entre a
+checagem `lstat` de `resolveTarget` e o `open`). Agora abre o destino final
+com `O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW` (guard `?? 0` para plataformas sem
+a constante) e escreve via handle (`Buffer.from(content, "utf8")`) com o
+helper **`writeFully`** (R3 da auditoria pós-implementação): loop de
+escrita que retoma do `bytesWritten` reportado — escrita curta do
+`handle.write` (que o antigo `fsPromises.writeFile` cobria por dentro) não
+produz mais arquivo truncado silencioso — e aborta com erro explícito
+("write made no progress (N/M bytes written)") quando uma escrita retorna
+ZERO bytes; nunca reporta bytes não gravados. O descritor é fechado em
+`finally` (falha de close nunca mascara o erro de escrita). `ELOOP` é
+traduzido em mensagem honesta ("refusing to write: target is a symlink
+(O_NOFOLLOW rejected the open…)"); criação e sobrescrita legítimas de
+arquivos regulares preservadas (observed behavior e formato
+"written N bytes to …" idênticos). Residual explícito: troca de
+componentes de diretório, hardlinks e bind-mounts não são cobertos — Onda
+3 (sandbox); a corrida lstat→open NÃO está "resolvida por prova": o ramo
+`ELOOP` é evidência ESTÁTICA do flag (flags em `writeFile`), não dinâmica — residual.
+Testes F8 (3): criação + sobrescrita legítimas e conteúdo multi-byte
+byte-exato; recusa de leaf symlink pré-existente (o alvo externo permanece
+intacto); recusa após substituição do leaf regular por symlink — MESMO
+RESULTADO da recusa, mas pelo ramo da PRÉ-CHECAGEM de `resolveTarget` (o
+teste não alcança o ramo `ELOOP` e não reproduz a corrida real; a
+janela lstat→open não é hookável sem injeção de fs, deliberadamente fora
+do escopo) + sanidade de `O_NOFOLLOW` disponível no runtime.
+Testes `writeFully` (4, cenários scriptados num FileHandle falso &
+determinístico): escrita completa em uma única chamada; escrita curta
+retomando apenas a cauda não gravada (subarray(offset)); falha de escrita
+propagada (nada de sucesso parcial mentiroso); zero progresso → erro
+explícito e sem repetição. O caminho real com arquivo regular mantém
+cobertura pelos testes filetools acima.
+
+### Lote B — cancelamento dos readers de corpo de erro e 400-probe
+`readBounded` (`src/providers/http/transport.ts`) ganhou o parâmetro
+`cancelWhenDone` (default `false` — chamadores existentes inalterados):
+após o trecho ser coletado (cap atingido, stream terminado, erro de leitura
+ou abort), o `reader.cancel()` libera a conexão; falhas de cancel são
+engolidas (`.catch(() => undefined)`) e nunca mascaram o resultado.
+`errorFrom` (excerpt 2 KB) e o 400-probe (300 B) passam `true`; o caminho de
+sucesso por rodadas NÃO (o `finally` de `consume()` é o dono — sem cancel
+duplo). Testes (4): excerpt de erro 2 KB de corpo 10 KB com cancel
+verificado no stream e erro original/truncamento/`kind` preservados; probe
+400 com retry F4 íntegro (exatamente 1 retry, resposta limpa) e probe
+cancelado; cancel hostil (stream cujo `cancel()` lança) não mascara o
+"HTTP 503"; sucesso de rodada SEM cancel duplo — comprovado por contador de
+`cancel()` no stream de sucesso (ZERO disparos; R4 da auditoria:
+substitui o teste fraco anterior, que só conferia o conteúdo).
+Regressões checadas pela suíte: redação R2, cap SSE por linha R1,
+AbortSignal R4 — verdes.
+
+### Lote C — provider testabilidade e comportamento determinístico
+- **C1 — healthCheck injetável**: `NVIDIAOptions`/`OpenRouterOptions`
+  ganham `fetchImpl?: typeof fetch` (NVIDIA já o usava para chat; agora o
+  healthCheck de AMBOS honra: `(this.fetchImpl ?? fetch).call(globalThis,
+  …)`). Default fetch global; `start()` existente inalterado; `detail`
+  segue sem segredo (status/erro de rede apenas). Testes (2): sucesso
+  (`GET …/models` → 200, detail sem `Bearer`/prefixo de chave), 401,
+  ECONNREFUSED e verificação de que um `AbortSignal` é de fato repassado
+  (timeout aplicável). nvidia: mesmo par (ok/falha de rede).
+- **C2 — corpo de erro do adaptador OpenCode**: o shim de prompt
+  (`src/providers/opencode.ts`) substituiu `res.text()` (corpo
+  ilimitado em memória) por `readBounded(res, 300, undefined, true)` —
+  helper exportado (`applyPromptCompatibility`) para teste direto com
+  cliente falso, sem servidor 1.x real. Mensagem mantida em forma
+  ("session.prompt failed (N): …", trecho ≤ 300 cr). `res.json()` do
+  caminho de SUCESSO permanece (contrato estruturado do cliente 2.0 —
+  residual documentado acima). Teste (1): corpo de erro de 2 MB
+  (stream pull-based) → mensagem emitida < 360 chars; exatamente 1 fetch
+  bruto de fallback.
+- **C3 — modelos sem tool calling**: decisão registrada, sem alteração de
+  código (ver "Observações" do §9): sem catálogo/gate local — o erro
+  explícito e recuperável segue o comportamento; escolha de modelo com
+  tool calling documentada.
+
+### Lote D — orquestrador: `changedFiles` determinístico e truncamento explícito
+`src/orchestrator.ts`: `changedFiles` agora é exportada e aceita
+`inspectGitImpl` injetável (default: `git.inspectGit` — produção
+inalterada). Comportamento provado por testes (4):
+1. `.oae/` e `.opencode/` (árvores e entradas de diretório) são excluídos
+   por SEGMENTO de caminho — incluindo o caso porcelain " M path", que o
+   filtro antigo (`startsWith(".oae")` sobre a linha CRUA com prefixo de
+   status) deixava vazar; arquivos de projeto que apenas COMEÇAM com
+   ".oae" (".oae-lookalike.ts") permanecem legítimos (o antigo filtro,
+   com seu match por prefixo cru, os excluía indevidamente).
+2. Arquivos de baseline (parâmetro `exclude` — lista inalterada do caller
+   em `orchestrator.ts:406`) continuam removidos.
+3. Strip correta do formato porcelain `XY ` (incl. " M", "MM", "A ", "D ",
+   "??") — o regex antigo `^[MARC?]+\s*` não cobria o espaço inicial do
+   unstaged deixava prefixos sujos nos relatórios. Correção pós-auditoria
+   (R1): a classe inclui também **`T`** (typechange) do alfabeto
+   A C D M R T U X ! ? — testado em `" T path"`, `"T  path"` e
+   `" T .oae/…"` (artefato continua filtrado).
+4. >50 arquivos → marcador explícito na ÚLTIMA posição
+   ("…(N more changed files omitted — list truncated at 50)") com a
+   contagem exata de omissos; ≤50 → lista íntegra, sem marcador.
+Contrato público preservado: `filesChanged: string[]` (`store.ts` v1) e o
+renderizador de relatório continuam recebendo um `string[]`.
+Decisão de escopo (dono, registrada): `.opencode/` excluído como artefato
+do harness (a OAE não o produz nem o consome como artefato de tarefa;
+config do próprio opencode). Se um projeto legítimo mantiver conteúdo de
+produto sob `.opencode/`, os arquivos editados nele não aparecerão em
+filesChanged — exclusão registrada aqui deliberadamente (reavaliar na Onda 3 se isto
+se tornar real).
+
+### Pendências transferidas (sem alegação de resolução)
+- **A3** (±1 char, cosmético): aguardando decisão de aceite/correção do dono.
+- **Sandbox de escrita completa** (dir-swap/hardlink/bind-mount): Onda 3.
+- **Testes opt-in** (`OAE_RUNTIME_TEST=1`, `OAE_OPENROUTER_REAL=1`):
+  executáveis SOMENTE com autorização (dir isolado, cap 900 s, credenciais
+  apenas no ambiente).
+- **Leak de conexão no caminho de SUCESSO non-streaming** (pré-existente e
+  evidenciado pelo teste R4 do Lote B com contador de `cancel()`): o
+  `res.body?.cancel()` do `finally` de `consume()` não reverte travado (o
+  reader interno do `readBounded` não está liberado) — falha engolida, sem
+  efeito funcional; candidato a reutilizar o padrão `cancelWhenDone` do
+  Lote B num follow-up de 1 linha. NÃO é cancel duplo (o cancel do stream
+  dispara ZERO vezes — comprovado).
+- **`res.json()` do caminho de sucesso do adaptador OpenCode**: leitura
+  limitada incompatível com o retorno estruturado — residual documentado.
+- **Transportes undici reais**: comportamento de cancel/limites inferido
+  estaticamente (mocks completos; nenhuma rede nesta etapa).

@@ -30,6 +30,7 @@ import type { OpenCodeClient } from "@opencode/client";
 import { Service } from "@opencode/client/service";
 import type { Endpoint } from "@opencode/client/service";
 import { nowISO, truncate } from "../util.ts";
+import { readBounded } from "./http/transport.ts";
 import type {
   AgentRunResult,
   AgentRunner,
@@ -79,7 +80,10 @@ export async function connect(): Promise<{ client: Client; endpoint: Endpoint }>
  * 2.0.32 vs servers 1.19.3 / 0.0.0-dev-202610161232). Route the OAE prompt
  * calls through the accepted wire format, transparently to AgentRunner.
  */
-function applyPromptCompatibility(client: Client, baseUrl: string): void {
+/** Exported for tests (Etapa 3/C2): the shim is exercised directly with a
+ * fake client so the bounded error-body path can be tested deterministically
+ * without spawning a real 1.x server. */
+export function applyPromptCompatibility(client: Client, baseUrl: string): void {
   const session = client.session as unknown as {
     prompt: ((input: { sessionID: string; text: string }) => Promise<unknown>) | undefined;
   };
@@ -98,7 +102,14 @@ function applyPromptCompatibility(client: Client, baseUrl: string): void {
         body: JSON.stringify({ sessionID: input.sessionID, prompt: { text: input.text } }),
       });
       if (!res.ok) {
-        const body = await res.text().catch(() => "");
+        // Etapa 3 (C2): bounded read — this shim's error body used res.text(),
+        // materializing an UNBOUNDED service-provided body. readBounded caps
+        // the excerpt in memory and releases the connection (cancelWhenDone,
+        // same hygiene as the direct transports); the success path's
+        // res.json() stays as-is by design (trusted local service, residual
+        // documentada). Message shape kept exactly as before.
+        const excerpt = await readBounded(res, 300, undefined, true);
+        const body = excerpt.text;
         throw new Error(`session.prompt failed (${res.status}): ${body.slice(0, 300)}`);
       }
       return await res.json().catch(() => undefined);

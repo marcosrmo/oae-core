@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import { strict as assert } from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod, appendFile, symlink } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile, stat, readdir, mkdir, chmod, appendFile, symlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -3632,4 +3632,409 @@ test("R2: a secret GLUED to adjacent text is redacted — full key and straddlin
       },
     );
   }
+});
+
+/* ── Etapa 3 / Lote A: mitigação F8 (O_NOFOLLOW no componente final da escrita) ── */
+
+test("filetools F8: legitim create AND overwrite of regular files keep working through the secured open", async () => {
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    // creation (O_CREAT)
+    const w1 = await ts.execute("write_file", JSON.stringify({ path: "a/b.txt", content: "first" }));
+    assert.match(w1, /written 5 bytes to a\/b\.txt/);
+    assert.equal(await readFile(join(dir, "a", "b.txt"), "utf8"), "first");
+    // overwrite of a REGULAR existing file must not be broken (O_TRUNC)
+    const w2 = await ts.execute("write_file", JSON.stringify({ path: "a/b.txt", content: "second!" }));
+    assert.match(w2, /written 7 bytes to a\/b\.txt/);
+    assert.equal(await readFile(join(dir, "a", "b.txt"), "utf8"), "second!");
+    // multi-byte content still lands byte-exact (utf8 conversion intact)
+    const uni = "héllo—ü✓";
+    await ts.execute("write_file", JSON.stringify({ path: "u.txt", content: uni }));
+    assert.equal(await readFile(join(dir, "u.txt"), "utf8"), uni);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F8: pre-existing leaf symlink is still refused with the SAME message", async () => {
+  const dir = await makeProject();
+  try {
+    const outside = join(await mkdtemp(join(tmpdir(), "oae-out2-")), "outside.txt");
+    await writeFile(outside, "top secret", "utf8");
+    await symlink(outside, join(dir, "lure.txt"));
+    const ts = new FileToolSet(dir);
+    const w = await ts.execute("write_file", JSON.stringify({ path: "lure.txt", content: "x" }));
+    assert.match(w, /target is a symlink/);
+    assert.equal(await readFile(outside, "utf8"), "top secret");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("filetools F8: a leaf swapped to a symlink is refused — same refusal RESULT (pre-check branch); the ELOOP branch of open(O_NOFOLLOW) stays STATIC evidence only", async () => {
+  // Honest scope (R2, pós-auditoria): this test does NOT reproduce the real
+  // lstat→open race and does NOT reach the ELOOP branch of open(O_NOFOLLOW).
+  // The symlink exists BEFORE the write call, so resolveTarget's lstat
+  // pre-check refuses first — the same refusal the pre-existing symlink test
+  // already pins. What this test adds: the refusal is stable when the leaf
+  // BECAME a symlink after a legitimate first write (swap), and O_NOFOLLOW is
+  // available on the runtime platform (flag sanity — static evidence that the
+  // race window is closed in writeFile). Reaching ELOOP deterministically
+  // would require fs injection into writeFile; that is deliberately out of
+  // scope (no disproportional abstraction — docs/onda2-plan.md §10).
+  const dir = await makeProject();
+  try {
+    const ts = new FileToolSet(dir);
+    const w1 = await ts.execute("write_file", JSON.stringify({ path: "r.txt", content: "ok" }));
+    assert.match(w1, /written 2 bytes/);
+    const swapTarget = join(dir, "r.txt");
+    await rmNative(swapTarget);
+    await symlink(join(await mkdtemp(join(tmpdir(), "oae-swap-")), "late.txt"), swapTarget);
+    const w2 = await ts.execute("write_file", JSON.stringify({ path: "r.txt", content: "x" }));
+    // the refusal text is shared by the pre-check branch and the ELOOP branch
+    // (both name "target is a symlink"); this assertion cannot tell them apart
+    // and MUST NOT be presented as ELOOP proof
+    assert.match(w2, /target is a symlink/);
+    const fsPromises = await import("node:fs/promises");
+    assert.ok(typeof fsPromises.constants.O_NOFOLLOW === "number", "O_NOFOLLOW available on this platform");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+async function rmNative(p: string): Promise<void> {
+  const fs = await import("node:fs/promises");
+  await fs.unlink(p).catch(() => undefined);
+}
+
+// ── Etapa 3 / Lote B: cancelamento dos readers de corpo de erro e 400-probe ──
+
+/** Response body wrapper that RECORDS when the underlying stream cancel() is
+ * invoked (reader.cancel() e body.cancel() aterrissam neste hook). */
+function trackedBody(bytes: Uint8Array[], opts: { status: number; contentType?: string }): {
+  res: Response;
+  wasCancelled: () => boolean;
+} {
+  let cancelled = false;
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) { for (const b of bytes) c.enqueue(enc.encode(String.fromCharCode(...b))); /* intentionally NOT closed: an ENDED stream cannot be cancelled, and these paths stop mid-body */ },
+    cancel() { cancelled = true; },
+  });
+  const res = new Response(stream, { status: opts.status, headers: { "content-type": opts.contentType ?? "text/plain" } });
+  return { res, wasCancelled: () => cancelled };
+}
+
+test("cancel: the error-body excerpt path releases its reader after reading (excerpt preserved)", async () => {
+  // body > cap (10 KB): read stops at 2 KB exactly as before, then cancel fires
+  const big = `HTTP 500-ish error payload ${"x".repeat(10_000)}`;
+  const { res, wasCancelled } = trackedBody([new Uint8Array(Buffer.from(big))], { status: 500 });
+  const { fetch: f } = recordingFetch(() => res);
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  const pe = err as ProviderError;
+  assert.ok(pe instanceof ProviderError);
+  assert.match(pe.message, /HTTP 500: HTTP 500-ish error payload/, "excerpt preserved in the original error");
+  assert.match(pe.message, /body truncated/, "cap marker intact");
+  assert.equal((pe as ProviderError).kind, "unavailable", "classification intact");
+  assert.equal(wasCancelled(), true, "reader released after the bounded read");
+});
+
+test("cancel: the 400-probe releases its stream and keeps the one-read fallback semantics", async () => {
+  // probe body carries "stream" → the transport makes its ONE non-streaming
+  // retry (F4) against a FRESH fallback response; the probe stream itself is
+  // released right after the bounded read
+  let calls = 0;
+  const { res, wasCancelled } = trackedBody([new Uint8Array(Buffer.from(`the streamed body is unsupported by this gateway ${"y".repeat(5_000)}`))], { status: 400 });
+  const { fetch: f } = recordingFetch(() => {
+    calls += 1;
+    return calls === 1 ? res : jsonResponse({ choices: [{ index: 0, message: { role: "assistant", content: "fallback" } }] });
+  });
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }) as ChatReply;
+  assert.equal(rep.content, "fallback", "F4 retry semantics intact (exactly one probe-driven retry)");
+  assert.equal(calls, 2, "one raw 400 call + one non-streaming retry");
+  assert.equal(wasCancelled(), true, "probe stream released after its bounded read");
+});
+
+test("cancel: a cancel() failure never masks the original error or the excerpt", async () => {
+  let cancelledCalls = 0;
+  const enc = new TextEncoder();
+  const payload = `boom ${"z".repeat(2_500)}`;
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(enc.encode(payload)); /* no close: an ended stream cannot observe cancel() */ },
+    cancel() { cancelledCalls += 1; throw new Error("cancel always fails (hostile mock)"); },
+  });
+  const res = new Response(stream, { status: 503, headers: { "content-type": "text/plain" } });
+  const { fetch: f } = recordingFetch(() => res);
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const err = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => e,
+  );
+  const pe = err as ProviderError;
+  assert.match(pe.message, /HTTP 503: boom/, "original error intact");
+  assert.match(pe.message, /body truncated/, "cap marker intact");
+  assert.equal((pe as ProviderError).kind, "unavailable");
+  assert.equal(cancelledCalls, 1, "cancel attempted exactly once despite failing");
+});
+
+test("cancel: round success reads are NOT double-cancelled — stream cancel counter stays at ZERO on the success path", async () => {
+  // R4 (pós-auditoria): prove the NEGATIVE with the same instrumentation the
+  // error-path tests use. The success non-streaming body is read via
+  // readBounded WITHOUT cancelWhenDone (consume's finally owns the reader):
+  // readBounded must not cancel it. consume's own res.body?.cancel() attempt
+  // no-ops silently against the internal reader (locked stream → TypeError,
+  // swallowed) — that is the documented connection-leak residual, NOT a
+  // double cancel: the stream's underlying cancel() hook must never fire.
+  let cancels = 0;
+  const enc = new TextEncoder();
+  const payload = JSON.stringify({ choices: [{ index: 0, message: { role: "assistant", content: "ok" } }] });
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(enc.encode(payload)); c.close(); },
+    cancel() { cancels += 1; },
+  });
+  const res = new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+  const { fetch: f } = recordingFetch(() => res);
+  const t = new HttpTransport({ ...ORPROVIDER, fetchImpl: f });
+  const rep = await t.chat({ model: "m", messages: [{ role: "user", content: "u" }], signal: AbortSignal.timeout(10_000) }) as ChatReply;
+  assert.equal(rep.content, "ok");
+  assert.equal(cancels, 0, "no cancel from readBounded on success and no effective double cancel via consume's finally");
+});
+
+// ── Etapa 3 / Lote C: healthCheck injetável (C1) + corpo limitado do adaptador OpenCode (C2) ──
+
+test("openrouter healthCheck: injectable fetch honored — success, HTTP failure, network error, signal passed", async () => {
+  const prevOR = process.env.OPENROUTER_API_KEY;
+  process.env.OPENROUTER_API_KEY = ORKEY;
+  try {
+    // success: injected impl is used, detail carries only the URL/status
+    const { fetch: ok } = recordingFetch(() => jsonResponse({ data: [{架号: "m1" }] }));
+    const pOk = OpenRouterProvider.start({ fetchImpl: ok });
+    const h1 = await pOk.healthCheck();
+    assert.equal(h1.ok, true);
+    assert.match(h1.detail ?? "", /GET <openrouter>.*200/);
+    assert.doesNotMatch(h1.detail ?? "", /Bearer|sk-or/);
+
+    // HTTP failure: ok=false, status visible, key never echoed
+    const { fetch: unauthorized } = recordingFetch(() => jsonResponse({ error: "denied" }, 401));
+    const p401 = OpenRouterProvider.start({ fetchImpl: unauthorized });
+    const h2 = await p401.healthCheck();
+    assert.equal(h2.ok, false);
+    assert.match(h2.detail ?? "", /401/);
+    assert.doesNotMatch(h2.detail ?? "", /Bearer|sk-or/);
+
+    // network error: honest detail from the thrown error (no secret added)
+    const { fetch: refused } = recordingFetch(() => { throw new Error("ECONNREFUSED (no secret here)"); });
+    const pRef = OpenRouterProvider.start({ fetchImpl: refused });
+    const h3 = await pRef.healthCheck();
+    assert.equal(h3.ok, false);
+    assert.match(h3.detail ?? "", /ECONNREFUSED/);
+
+    // timeout applicability: an AbortSignal is prepared and handed over
+    let seenSignal: AbortSignal | undefined;
+    const { fetch: spy } = recordingFetch((call) => { seenSignal = (call.init as RequestInit).signal as AbortSignal; return jsonResponse({}); });
+    await OpenRouterProvider.start({ fetchImpl: spy }).healthCheck();
+    assert.ok(seenSignal instanceof AbortSignal, "timeout signal wired into the healthCheck fetch");
+  } finally {
+    if (prevOR === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevOR;
+  }
+});
+
+test("nvidia healthCheck: injectable fetch honored (same four cases)", async () => {
+  const { fetch: ok } = recordingFetch(() => jsonResponse({ models: [] }));
+  const h1 = await NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: ok }).healthCheck();
+  assert.equal(h1.ok, true);
+  assert.match(h1.detail ?? "", /GET <nvidia>.*200/);
+  assert.doesNotMatch(h1.detail ?? "", /Bearer|nvapi-/);
+
+  const { fetch: refused } = recordingFetch(() => { throw new Error("network down (no secret)"); });
+  const h3 = await NVIDIAProvider.start({ apiKey: TKEY, fetchImpl: refused }).healthCheck();
+  assert.equal(h3.ok, false);
+  assert.match(h3.detail ?? "", /network down/);
+});
+
+test("openCode adapter C2: raw-fetch error body is bounded (no unbounded text() on the shim)", async () => {
+  const openCodeModule = await import("../src/providers/opencode.ts");
+  const applyPromptCompatibility = openCodeModule.applyPromptCompatibility;
+  const calls: { url: string; init: RequestInit }[] = [];
+  const realFetch = globalThis.fetch;
+  try {
+    let n = 0;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      n += 1;
+      // the shim makes exactly ONE raw fallback call; answer it with an
+      // oversized 400 error body (2 MB pull-driven)
+      return oversizedResponse({ status: 400, contentType: "text/plain", bodyBytes: 2_000_000, chunkBytes: 16_384 }).res;
+    }) as typeof fetch;
+    const fakeClient = {
+      session: {
+        prompt: undefined,
+      } as unknown as object,
+    } as unknown as Parameters<typeof applyPromptCompatibility>[0];
+    const fakeSession = { prompt: async (input: { sessionID: string; text: string }) => { throw new Error("raw wire retry: prompt"); } };
+    (fakeClient as { session: object }).session = fakeSession;
+    applyPromptCompatibility(fakeClient, "http://127.0.0.1:4099/api/app");
+    const shim = fakeSession.prompt({ sessionID: "s1", text: "hi" }) as Promise<unknown>;
+    await shim.then(
+      () => { throw new Error("must reject"); },
+      (e: unknown) => {
+        const m = String((e as Error).message);
+        assert.match(m, /session\.prompt failed \(400\): /);
+        assert.ok(m.length < 360, `excerpt bounded in the emitted message (got ${m.length} chars)`);
+      },
+    );
+    assert.equal(calls.length, 1, "exactly the one raw fallback fetch (original came through the fake shim)");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// ── Etapa 3 / Lote D: changedFiles determinístico (inspectGit mockado) ──────
+
+function gitStatusMock(uncommitted: string[]) {
+  return async (_dir: string) => ({
+    isRepo: true as boolean,
+    branch: "main",
+    remote: null as string | null,
+    uncommitted,
+    hasCommits: true as boolean,
+  });
+}
+
+test("orchestrator D: .oae/ and .opencode/ trees are excluded segment-scoped; legit project files kept", async () => {
+  const { changedFiles } = await import("../src/orchestrator.ts");
+  const fake = gitStatusMock([
+    "?? .oae/state.json",
+    " M .oae/tasks/1.md",
+    "M  .opencode/config.json",
+    "?? .oae/",
+    "?? .opencode",
+    " M src/a.ts",
+    "M  README.md",
+    "?? .oae-lookalike.ts", // merely STARTS with ".oae" → legit project file
+    "?? .opencode-like.ts", // same rule for .opencode lookalikes
+  ]);
+  const files = await changedFiles("/proj", [], fake);
+  assert.deepEqual(files, ["src/a.ts", "README.md", ".oae-lookalike.ts", ".opencode-like.ts"]);
+});
+
+test("orchestrator D: baseline files are excluded via the exclude list", async () => {
+  const { changedFiles } = await import("../src/orchestrator.ts");
+  const fake = gitStatusMock([" M src/a.ts", "M  README.md", " M notes.txt"]);
+  const files = await changedFiles("/proj", ["README.md", "notes.txt"], fake);
+  assert.deepEqual(files, ["src/a.ts"]);
+});
+
+test("orchestrator D: porcelain ' M path' form is stripped cleanly (no dirty prefixes)", async () => {
+  const { changedFiles } = await import("../src/orchestrator.ts");
+  const fake = gitStatusMock([
+    " M src/unstaged.ts",
+    "?? src/untracked.ts",
+    "MM src/both.ts",
+    "A  src/staged.ts",
+    "D  src/deleted.ts",
+  ]);
+  const files = await changedFiles("/proj", [], fake);
+  assert.deepEqual(files, ["src/unstaged.ts", "src/untracked.ts", "src/both.ts", "src/staged.ts", "src/deleted.ts"]);
+  // the runtime-artifact filter sees CLEAN paths: a dirty prefix would leak it
+  const dirty = await changedFiles("/proj", [], gitStatusMock([" M .oae/leak.md"]));
+  assert.deepEqual(dirty, [], "no ' M .oae/…' leak through the filter");
+});
+
+test("orchestrator D: >50 files produce an explicit truncation marker with the omitted count", async () => {
+  const { changedFiles, MAX_CHANGED_FILES } = await import("../src/orchestrator.ts");
+  const many = Array.from({ length: 60 }, (_, i) => `M  src/gen${i}.ts`);
+  const files = await changedFiles("/proj", [], gitStatusMock(many));
+  assert.equal(files.length, MAX_CHANGED_FILES + 1);
+  assert.equal(files[0], "src/gen0.ts");
+  assert.equal(files[MAX_CHANGED_FILES - 1], `src/gen${MAX_CHANGED_FILES - 1}.ts`);
+  assert.match(
+    files[MAX_CHANGED_FILES],
+    /^…\(10 more changed files omitted — list truncated at 50\)$/,
+    "explicit, counted truncation instead of a silent slice",
+  );
+  // ≤50 files: no marker, contract unchanged
+  const few = await changedFiles("/proj", [], gitStatusMock(many.slice(0, 40)));
+  assert.equal(few.length, 40);
+});
+
+// ── Etapa 3 / correções R1 e R3 (pós-auditoria) ─────────────────────────────
+
+test("orchestrator R1: porcelain typechange 'T' status is stripped and filtered like the other statuses", async () => {
+  const { changedFiles } = await import("../src/orchestrator.ts");
+  const fake = gitStatusMock([
+    " T src/typechange.ts",   // unstaged typechange (e.g. symlink → regular)
+    "T  src/staged-typechange.ts", // staged typechange
+    " T .oae/typeflip.md",    // runtime artifact with a typechange status
+    "?? .oae-lookalike.ts",   // legitimate project file must survive
+  ]);
+  const files = await changedFiles("/proj", [], fake);
+  assert.deepEqual(
+    files,
+    ["src/typechange.ts", "src/staged-typechange.ts", ".oae-lookalike.ts"],
+    "' T path' must strip cleanly; '.oae/' artifacts stay filtered even under typechange",
+  );
+});
+
+/** R3: deterministic fake FileHandle — production regular files cannot be
+ * made to emit partial/zero-progress writes on demand without a
+ * disproportional fs-injection layer, so the helper itself is what gets the
+ * scripted scenarios (the REAL-file full-write path keeps its normal-path
+ * coverage in the filetools tests above). */
+function fakeHandle(script: { writes: (number | Error)[] }): { fake: FileHandle; calls: { offsetStart: number; length: number }[] } {
+  let i = 0;
+  const calls: { offsetStart: number; length: number }[] = [];
+  const fake = {
+    async write(buf: Uint8Array, offset: number, length: number): Promise<{ bytesWritten: number; bufferSize: number }> {
+      const next = script.writes[i++];
+      if (next instanceof Error) throw next;
+      const n = next ?? 0;
+      calls.push({ offsetStart: offset, length });
+      return { bytesWritten: n, bufferSize: buf.byteLength };
+    },
+  } as unknown as FileHandle;
+  return { fake, calls };
+}
+
+test("writeFully R3: complete buffer in a single write (normal path)", async () => {
+  const { writeFully } = await import("../src/providers/http/filetools.ts");
+  const buf = Buffer.from("full payload", "utf8");
+  const h = fakeHandle({ writes: [buf.length] });
+  await writeFully(h.fake, buf);
+  assert.deepEqual(h.calls, [{ offsetStart: 0, length: buf.length }], "exactly one write covering the whole buffer");
+});
+
+test("writeFully R3: partial writes resume from the bytes actually written and complete the buffer", async () => {
+  const { writeFully } = await import("../src/providers/http/filetools.ts");
+  const buf = Buffer.from("0123456789", "utf8"); // 10 bytes
+  const h = fakeHandle({ writes: [2, 3, 5] }); // partial 2 + 3, then the remaining 5
+  await writeFully(h.fake, buf);
+  assert.deepEqual(
+    h.calls,
+    [
+      { offsetStart: 0, length: 10 }, // chunk = whole buffer
+      { offsetStart: 0, length: 8 },  // resume: subarray(2) — only the UNwritten tail
+      { offsetStart: 0, length: 5 },  // resume: subarray(5)
+    ],
+    "each retry targets only the unwritten tail; with O_TRUNC and sequential writes at the advancing file position, the retry chain lands the full buffer in order, byte-exact",
+  );
+});
+
+test("writeFully R3: a write failure propagates — no partial-success lie", async () => {
+  const { writeFully } = await import("../src/providers/http/filetools.ts");
+  const h = fakeHandle({ writes: [new Error("EIO: simulated write failure")] });
+  await writeFully(h.fake, Buffer.from("data")).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => assert.match((e as Error).message, /EIO: simulated write failure/, "the original error reaches the caller; writeFile's finally still closes the handle"),
+  );
+});
+
+test("writeFully R3: a zero-progress write aborts with an explicit error (no silent truncation, no busy loop)", async () => {
+  const { writeFully } = await import("../src/providers/http/filetools.ts");
+  const h = fakeHandle({ writes: [0] });
+  await writeFully(h.fake, Buffer.from("steady", "utf8")).then(
+    () => { throw new Error("must reject"); },
+    (e: unknown) => assert.match((e as Error).message, /write made no progress \(0\/6 bytes written\)/, "explicit failure instead of reporting bytes that were never written"),
+  );
+  assert.equal(h.calls.length, 1, "no retry after zero progress (loop terminated)");
 });

@@ -571,13 +571,41 @@ export class Orchestrator {
   }
 }
 
-async function changedFiles(dir: string, exclude: string[] = []): Promise<string[]> {
-  const st = await git.inspectGit(dir);
-  return st.uncommitted
-    .filter((f) => !f.startsWith(".oae"))
-    .map((f) => f.replace(/^[MARC?]+\s*/, ""))
-    .filter((f) => !exclude.includes(f))
-    .slice(0, 50);
+/**
+ * Etapa 3 / Lote D: deterministic and bounded run-file list for the report.
+ * - filter is now SEGMENT-scoped: `.oae/` and `.opencode/` trees (including
+ *   the bare dir entries) are tool-owned and excluded, while a project file
+ *   that merely STARTS with ".oae" (e.g. ".oaesync") is legitimately kept —
+ *   the old `startsWith(".oae")` over-excluded such names.
+ * - inspectGitImpl is injectable for tests (default stays the real impl);
+ * - the 50-entry cap NO LONGER truncates silently: the marker names how many
+ *   paths were omitted. Contract of `filesChanged: string[]` (store.ts) and
+ *   the report renderer are preserved.
+ */
+export const MAX_CHANGED_FILES = 50;
+export async function changedFiles(
+  dir: string,
+  exclude: string[] = [],
+  inspectGitImpl: (dir: string) => Promise<git.GitStatus> = git.inspectGit,
+): Promise<string[]> {
+  const st = await inspectGitImpl(dir);
+  const isRuntimeArtifact = (f: string): boolean =>
+    f === ".oae" || f === ".opencode" || f.startsWith(".oae/") || f.startsWith(".opencode/");
+  // porcelain v1 status column: exactly "XY " before the path. X/Y use the
+  // status alphabet A C D M R T U X ! ? (and blank) — T is typechange (e.g.
+  // a symlink flipped to a regular file), U marks unmerged. Handling the
+  // fixed-width column — instead of only the old `^[MARC?]+\s*` regex, which
+  // missed the unstaged " M path" form — matters because a dirty prefix
+  // (" M .oae/x") would slip past the runtime-artifact filter below and
+  // pollute the report.
+  const stripStatus = (f: string): string => (/^[MADRCUT?!X ]{2} /.test(f.slice(0, 3)) ? f.slice(3) : f);
+  const kept = st.uncommitted
+    .map(stripStatus)
+    .filter((f) => !isRuntimeArtifact(f))
+    .filter((f) => !exclude.includes(f));
+  if (kept.length <= MAX_CHANGED_FILES) return kept;
+  const omitted = kept.length - MAX_CHANGED_FILES;
+  return [...kept.slice(0, MAX_CHANGED_FILES), `…(${omitted} more changed files omitted — list truncated at ${MAX_CHANGED_FILES})`];
 }
 
 function parseVerdict(output: string): ReviewVerdict | undefined {

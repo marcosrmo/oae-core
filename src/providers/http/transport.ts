@@ -194,7 +194,7 @@ export class HttpTransport {
         // F4: the excerpt is read EXACTLY once — a body already consumed can
         // never be re-read, so either the retry happens or the error message
         // carries the real gateway diagnostic (A1: bounded read, cap enforced)
-        const probe = await readBounded(res, 300, opts.signal);
+        const probe = await readBounded(res, 300, opts.signal, true);
         if (probe.text.toLowerCase().includes("stream")) {
           this.streamingDisabled = true;
           bodyObj.stream = false;
@@ -271,7 +271,10 @@ export class HttpTransport {
   }
 
   private async errorFrom(res: Response, signal?: AbortSignal): Promise<ProviderError> {
-    const excerpt = await readBounded(res, TRANSPORT_CAPS.errorExcerptBytes, signal);
+    // Etapa 3: the body is finished with after the excerpt — cancelWhenDone
+    // releases the connection; excerpt text and classification are built
+    // exactly as before
+    const excerpt = await readBounded(res, TRANSPORT_CAPS.errorExcerptBytes, signal, true);
     // R2: excerpt.text is CUT at the 2 KB cap, so a secret straddling the
     // boundary escapes plain redact() (needs ≥8 chars after its stem) —
     // redactTruncatedTail masks the trailing stem fragment first; the static
@@ -286,20 +289,25 @@ export class HttpTransport {
  * the cap check, so a single oversized wire chunk is materialized whole —
  * real HTTP chunks are small). Truncation is detected from `consumed > cap`.
  *
- * CANCELLATION IS THE CALLER'S CONCERN, not this function's: rounds consumed
- * via open().consume() cancel the reader in their finally; body-of-error and
- * 400-probe paths finish their read without an explicit reader.cancel() and
- * hand the connection back to the fetch layer (documented residual in
- * docs/onda2-plan.md §9 — cleanliness, not memory).
+ * CANCELLATION: rounds consumed via open().consume() cancel the reader in
+ * their finally. Error-body and 400-probe callers OWN their cleanup: pass
+ * `cancelWhenDone` to have this function release the body connection as
+ * soon as it stops reading (Etapa 3 / hygiene): cancel failures are
+ * swallowed and can never mask the caller's original error/success result.
+ * The success round path deliberately does NOT cancel here (consume's
+ * finally owns the reader lifecycle there).
  *
  * read errors, aborted/interrupted streams and, when a signal is given, an
  * interrupt during the read all degrade into honest fallback text — never an
  * unbounded host-controlled buffer. With real fetch the request signal aborts
- * the body stream itself, so this guard mainly closes the mock-vs-real gap. */
-async function readBounded(
+ * the body stream itself, so this guard mainly closes the mock-vs-real gap.
+ * Etapa 3 (C2): also reused by the OpenCode adapter's raw-fetch error shim
+ * (same bounded read semantics, exported for `src/opencode.ts`). */
+export async function readBounded(
   res: Response,
   cap: number,
   signal?: AbortSignal,
+  cancelWhenDone = false,
 ): Promise<{ text: string; bytesRead: number; truncated: boolean }> {
   const body = res.body;
   if (!body) return { text: "(empty body)", bytesRead: 0, truncated: false };
@@ -308,6 +316,7 @@ async function readBounded(
   let text = "";
   let consumed = 0;
   let truncated = false;
+  let result: { text: string; bytesRead: number; truncated: boolean };
   try {
     for (;;) {
       // R4: with a signal, an interrupt during the read no longer hangs on a
@@ -324,13 +333,20 @@ async function readBounded(
       }
       if (consumed > cap) { truncated = true; break; } // cap reached: stop reading
     }
+    result = { text, bytesRead: consumed, truncated };
   } catch {
     // read error / interrupted stream: partial text is still useful context
     if (!text) text = signal?.aborted ? "(read aborted by interrupt)" : "(unreadable body)";
     const note = text.startsWith("(") ? "" : `…(read interrupted after ${consumed} bytes)`;
-    return { text: text + note, bytesRead: consumed, truncated: true };
+    result = { text: text + note, bytesRead: consumed, truncated: true };
+  } finally {
+    // Etapa 3: error/probe callers release the connection here (cap already
+    // reached or stream finished) — AFTER the excerpt was collected, BEFORE
+    // returning to the caller; cancel failures are swallowed so they never
+    // mask the excerpt or the error being built from it
+    if (cancelWhenDone) await reader.cancel().catch(() => undefined);
   }
-  return { text, bytesRead: consumed, truncated };
+  return result;
 }
 
 function truncateBytes(s: string, max: number): string {

@@ -102,12 +102,15 @@ export class OpenRouterProvider implements Provider {
     return runner;
   }
 
-  /** Cheap liveness probe (GET /models): no model call, no tokens. */
+  /** Cheap liveness probe (GET /models): no model call, no tokens. Etapa 3
+   * (C1): honors the optional test-injectable fetch; default stays the
+   * global fetch so plain start() callers are untouched. detail carries
+   * ONLY the status — never headers/body/key. */
   async healthCheck(): Promise<{ ok: boolean; detail?: string }> {
     const url = `${this.baseUrl.replace(/\/+$/, "")}/models`;
     try {
       const signal = AbortSignal.timeout(10_000);
-      const res = await fetch(url, {
+      const res = await (this.fetchImpl ?? fetch).call(globalThis, url, {
         method: "GET",
         headers: {
           "authorization": `Bearer ${this.apiKey}`,
