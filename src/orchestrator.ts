@@ -599,10 +599,23 @@ export async function changedFiles(
   // (" M .oae/x") would slip past the runtime-artifact filter below and
   // pollute the report.
   const stripStatus = (f: string): string => (/^[MADRCUT?!X ]{2} /.test(f.slice(0, 3)) ? f.slice(3) : f);
+  // P0.2.1 (A2): P0.2 lists a baseline staged rename as TWO separate paths
+  // (both index entries were touched), while porcelain text still renders the
+  // combined "old -> new" form here. A rename entry is baseline work iff BOTH
+  // endpoints are excluded by the baseline list — a task-created rename can
+  // never have both endpoints there, because restored baseline paths end up
+  // untracked or unstaged-deleted and cannot form a fresh staged rename.
+  // Single-endpoint matches stay visible, so genuine task renames are never
+  // hidden; the literal legacy string ("old -> new") still matches directly.
+  const isBaselineRename = (stripped: string): boolean => {
+    const i = stripped.indexOf(" -> ");
+    if (i <= 0) return false;
+    return exclude.includes(stripped.slice(0, i)) && exclude.includes(stripped.slice(i + 4));
+  };
   const kept = st.uncommitted
     .map(stripStatus)
     .filter((f) => !isRuntimeArtifact(f))
-    .filter((f) => !exclude.includes(f));
+    .filter((f) => !exclude.includes(f) && !isBaselineRename(f));
   if (kept.length <= MAX_CHANGED_FILES) return kept;
   const omitted = kept.length - MAX_CHANGED_FILES;
   return [...kept.slice(0, MAX_CHANGED_FILES), `…(${omitted} more changed files omitted — list truncated at ${MAX_CHANGED_FILES})`];

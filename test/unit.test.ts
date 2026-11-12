@@ -4896,6 +4896,46 @@ test("P0.2.1 A2: baseline staged rename excluded from changedFiles; task change 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("P0.2.1 A2: baseline staged copy excluded from changedFiles (real git C record); task change kept", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "source.txt"), "conteudo fonte\nlinha2\n");
+    gStage(dir, "source.txt");
+    gBaseCommit(dir);
+    // git status only reports staged COPIES as real C records with
+    // status.renames=copies (the default detection reports renames only);
+    // repo-local config, not a mock — the C record below comes from real git.
+    gRun(dir, ["config", "status.renames", "copies"]);
+    // git copy detection needs the source INSIDE the staged change set
+    // (verified against git 2.43: a copy of an unmodified tracked file shows
+    // as plain A), so the baseline work modifies the source and stages an
+    // identical copy of the new content — the minimal real-git C fixture.
+    await writeFile(join(dir, "source.txt"), "conteudo fonte\nlinha2\nmais contexto\n");
+    gStage(dir, "source.txt");
+    await writeFile(join(dir, "cópia [1] ção.txt"), "conteudo fonte\nlinha2\nmais contexto\n");
+    gStage(dir, "cópia [1] ção.txt");
+
+    // sanity: the fixture really produces a porcelain C record with its orig
+    // field — this test exercises a genuine git C, never a fabricated string
+    const recs = gRun(dir, ["status", "--porcelain=v1", "-z"]).split("\0");
+    const cIdx = recs.findIndex((r) => r.startsWith("C  "));
+    assert.ok(cIdx >= 0, "the fixture produces a real porcelain C record (not a mock)");
+    assert.equal(recs[cIdx].slice(3), "cópia [1] ção.txt", "C record carries the copy path (spaces + UTF-8)");
+    assert.equal(recs[cIdx + 1], "source.txt", "C record carries the source as its orig field");
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("source.txt") && prep.baselineUncommitted.includes("cópia [1] ção.txt"), "both copy sides are baseline");
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+
+    const { changedFiles } = await import("../src/orchestrator.ts");
+    const files = await changedFiles(dir, prep.baselineUncommitted);
+    assert.ok(!files.includes("source.txt -> cópia [1] ção.txt"), "the pre-existing staged copy must not leak into changedFiles");
+    assert.ok(!files.includes("source.txt"), "the baseline source modification stays excluded");
+    assert.ok(files.includes("feature.txt"), "genuine task work stays visible");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("P0.2.1 A2: rename exclusion normalization (contract mocks)", async () => {
   const { changedFiles } = await import("../src/orchestrator.ts");
   // both endpoints on the baseline list ⇒ combined rename entry is excluded
