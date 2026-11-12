@@ -16,6 +16,7 @@ import { makePlan } from "../src/planner.ts";
 import { FakeRunner, REVIEWER_OK, REVIEWER_REJECT } from "./fake.ts";
 import { renderReport } from "../src/report.ts";
 import { inspectGit, prepareGit, commitAll } from "../src/git.ts";
+import type { GitStatus } from "../src/git.ts";
 import { Supervisor } from "../src/supervisor.ts";
 import { acquireRunLock, releaseRunLock, readRunLock } from "../src/runlock.ts";
 import { effectiveStatus, finalizeAbandonedRun, probeOwner, reconcileRun } from "../src/reconcile.ts";
@@ -193,7 +194,7 @@ test("task lifecycle: dispatch → review → validators → commit → done", a
     const orch = new Orchestrator(null, store, {
       config,
       plan: plan1(dir),
-      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : reviewer),
+      runnerFactory: (kind) => (kind === "coder" ? new WritingCoder("s-code", dir) : reviewer),
     });
     const { state } = await orch.run("add hello module");
     assert.equal(state.status, "done");
@@ -556,7 +557,7 @@ test("git commit: approved task produces a real commit hash (no identity configu
       const orch = new Orchestrator(null, store, {
         config,
         plan: plan1(dir),
-        runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+        runnerFactory: (kind) => (kind === "coder" ? new WritingCoder("s-code", dir) : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
       });
       const { state } = await orch.run("commit hash regression");
       const t = state.tasks[0];
@@ -1162,15 +1163,16 @@ test("markdown-formatted 'IMPEDIMENT: none' is not a real impediment (run-mvb27e
   try {
     const config = fastRecovery(await loadConfig(dir));
     const store = await Store.create(dir, "run-md-none", "bold none");
-    const coder = new FakeRunner("s-md", {
-      type: "complete",
-      output: "RESULT:\nfiles: src/hello.ts\n- **IMPEDIMENT:** none",
-    });
+    // markdown emphasis fixture preserved; the coder also produces real work so
+    // the committed change still exists after Mudança A (.oae churn is no
+    // longer committable)
+    const writingCoder = new WritingCoder("s-md", dir);
+    writingCoder.behavior = { type: "complete", output: "RESULT:\nfiles: src/hello.ts\n- **IMPEDIMENT:** none" };
     const reviewer = new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK });
     const orch = new Orchestrator(null, store, {
       config,
       plan: plan1(dir),
-      runnerFactory: (kind) => (kind === "coder" ? coder : reviewer),
+      runnerFactory: (kind) => (kind === "coder" ? writingCoder : reviewer),
     });
     const { state } = await orch.run("bold none");
     assert.equal(state.tasks[0].status, "done", "markdown emphasis must not fake an impediment");
@@ -4037,4 +4039,1624 @@ test("writeFully R3: a zero-progress write aborts with an explicit error (no sil
     (e: unknown) => assert.match((e as Error).message, /write made no progress \(0\/6 bytes written\)/, "explicit failure instead of reporting bytes that were never written"),
   );
   assert.equal(h.calls.length, 1, "no retry after zero progress (loop terminated)");
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0.1 — Mudança E: pre-commit guard against OAE-internal artifacts.
+// Every test here runs real git inside its own temporary repository; the OAE
+// repo itself is never used as a mutable test fixture.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Since Mudança A stops OAE's `git add` from staging `.oae/` runtime churn,
+ * a fake coder that writes NO files produces a task with nothing to commit
+ * ("done", no hash) — the commit hash some older tests asserted came solely
+ * from OAE-internal churn reaching the commit (fixed behavior). WritingCoder
+ * gives those tests real, non-internal work so they keep their original
+ * intent (a task whose work product is committed).
+ */
+class WritingCoder extends FakeRunner {
+  private targetDir: string;
+  constructor(id: string, dir: string) {
+    super(id, { type: "complete", output: "RESULT:\nfiles: src/hello.ts\ncommands: none" });
+    this.targetDir = dir;
+  }
+  async prompt(text: string): Promise<void> {
+    await mkdir(join(this.targetDir, "src"), { recursive: true });
+    await writeFile(join(this.targetDir, "src", "hello.ts"), "export const hello = () => \"hello\";\n");
+    await super.prompt(text);
+  }
+}
+
+const guardGitMod = await import("../src/git.ts");
+const { isInternalArtifactPath, parseStagedPathsFromStatusZ, assertNoInternalArtifactsStaged, InternalArtifactsStagedError, INTERNAL_EXCLUDE_PATHSPECS } = guardGitMod;
+const { execFileSync } = await import("node:child_process");
+
+function gRun(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" }) as string;
+}
+function gStagedSnapshot(dir: string): string {
+  return gRun(dir, ["status", "--porcelain=v1", "-z"]);
+}
+function gCommitCount(dir: string): number {
+  try {
+    return Number(gRun(dir, ["rev-list", "--count", "HEAD"]).trim());
+  } catch {
+    // unborn branch (no commit yet) — zero commits by definition
+    return 0;
+  }
+}
+function gBaseCommit(dir: string): void {
+  gRun(dir, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "base", "--allow-empty"]);
+}
+function gStage(dir: string, ...paths: string[]): void {
+  gRun(dir, ["add", "--", ...paths]);
+}
+
+test("guard path classifier: internal trees match, look-alikes do not", () => {
+  // internal: exact tree root and anything under it
+  assert.equal(isInternalArtifactPath(".oae"), true);
+  assert.equal(isInternalArtifactPath(".oae/state.json"), true);
+  assert.equal(isInternalArtifactPath(".oae/tasks/1.md"), true, "nested internal paths are internal");
+  assert.equal(isInternalArtifactPath(".opencode"), true);
+  assert.equal(isInternalArtifactPath(".opencode/skills/x.md"), true);
+  // look-alikes must never match (segment-anchored, no prefix logic)
+  assert.equal(isInternalArtifactPath(".oae-notes"), false);
+  assert.equal(isInternalArtifactPath(".oaestate.json"), false);
+  assert.equal(isInternalArtifactPath("docs/.oae-guide.md"), false);
+  assert.equal(isInternalArtifactPath("src/opencode.ts"), false);
+  assert.equal(isInternalArtifactPath(".opencodeiscool/x"), false);
+  assert.equal(isInternalArtifactPath(""), false);
+});
+
+test("guard parser: porcelain v1 -z staged-vs-unstaged separation, renames, fail-closed", () => {
+  const p = parseStagedPathsFromStatusZ;
+  // clean status (no records, no trailing NUL)
+  assert.deepEqual(p(""), []);
+  // staged modification/add
+  assert.deepEqual(p("M  a.ts\0"), ["a.ts"]);
+  assert.deepEqual(p("A  b.ts\0"), ["b.ts"]);
+  // unstaged-only entry is NOT a staged path
+  assert.deepEqual(p(" M a.ts\0"), []);
+  assert.deepEqual(p(" D d.ts\0"), []);
+  // staged typechange (T is a documented porcelain v1 status) → is a staged path
+  assert.deepEqual(p("T  link.txt\0"), ["link.txt"]);
+  assert.deepEqual(p("T  .oae/where.json\0"), [".oae/where.json"]);
+  // worktree-only typechange is NOT staged
+  assert.deepEqual(p(" T link.txt\0"), []);
+  // mixed record types: staged A, staged+unstaged M, untracked, unstaged
+  assert.deepEqual(p("A  .oae/state.json\0MM b.txt\0?? c.txt\0 D d.txt\0"), [".oae/state.json", "b.txt"]);
+  // staged rename: -z emits "to\0from" per git-status docs; both sides change the index
+  assert.deepEqual(p("R  new-name.ts\0old-name.ts\0"), ["new-name.ts", "old-name.ts"]);
+  // rename with a second unstaged record still consumed in order
+  assert.deepEqual(p("R  new.ts\0old.ts\0 M x.ts\0"), ["new.ts", "old.ts"]);
+  // truncated rename (missing original-path field) → fail closed
+  assert.throws(() => p("R  new-name.ts\0"), /truncated|original/);
+  // malformed record (invalid status columns) → fail closed
+  assert.throws(() => p("zz a.txt\0"), /malformed/);
+  // empty path field → fail closed
+  assert.throws(() => p("M  \0"), /empty path|malformed/);
+  // missing terminating NUL means truncated output → fail closed (empty
+  // output is the only legitimate case without a NUL, handled above)
+  assert.throws(() => p("M  a.ts\0M  b.ts"), /truncated/);
+  assert.throws(() => p("M  a.ts"), /truncated/);
+});
+
+test("guard blocks commitAll when .oae artifact is pre-staged; state untouched", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "internal runtime state\n");
+    gStage(dir, ".oae/state.json"); // pre-staged BEFORE the OAE operation
+    const before = gStagedSnapshot(dir);
+    const beforeCommits = gCommitCount(dir);
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.error, "guard must block the commit with an error");
+    assert.match(c.error!, /internal artifacts are staged/);
+    assert.ok(c.error!.includes(".oae/state.json"), "diagnostic lists the offending path");
+    assert.ok(!c.commit, "nothing was committed");
+
+    assert.equal(gCommitCount(dir), beforeCommits, "no new commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index content identical: pre-existing staged path preserved");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard blocks commitAll when .opencode artifact is pre-staged", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await mkdir(join(dir, ".opencode", "skills"), { recursive: true });
+    await writeFile(join(dir, ".opencode", "skills", "skill.md"), "installed skill\n");
+    gStage(dir, ".opencode/skills/skill.md");
+    const before = gStagedSnapshot(dir);
+    const beforeCommits = gCommitCount(dir);
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.error && c.error.includes(".opencode/skills/skill.md"), `guard lists .opencode path, got: ${c.error}`);
+    assert.ok(!c.commit, "nothing was committed");
+    assert.equal(gCommitCount(dir), beforeCommits, "no new commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index content identical when blocked");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard detects internal artifacts staged in nested subdirectories", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await mkdir(join(dir, ".oae", "tasks"), { recursive: true });
+    await writeFile(join(dir, ".oae", "tasks", "1.md"), "task record\n");
+    await mkdir(join(dir, ".opencode", "agents"), { recursive: true });
+    await writeFile(join(dir, ".opencode", "agents", "coder.md"), "agent\n");
+    gStage(dir, ".oae/tasks/1.md", ".opencode/agents/coder.md");
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.error && c.error.includes(".oae/tasks/1.md"), `guard lists .oae path, got: ${c.error}`);
+    assert.ok(c.error!.includes(".opencode/agents/coder.md"), `guard lists .opencode path, got: ${c.error}`);
+    assert.ok(!c.commit, "nothing was committed");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard never flags look-alike names; legitimate pre-staged user files commit normally", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await writeFile(join(dir, ".oae-notes"), "user file\n");
+    await mkdir(join(dir, "docs"), { recursive: true });
+    await writeFile(join(dir, "docs", ".oae-guide.md"), "user docs\n");
+    await mkdir(join(dir, "src"), { recursive: true });
+    await writeFile(join(dir, "src", "opencode.ts"), "user code\n");
+    await writeFile(join(dir, "feature.txt"), "user work\n");
+    gStage(dir, ".oae-notes", "docs/.oae-guide.md", "src/opencode.ts", "feature.txt");
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.commit, `look-alikes must not block, got: ${c.error}`);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("docs/.oae-guide.md"));
+    assert.ok(committed.includes("src/opencode.ts"));
+    assert.ok(committed.includes("feature.txt"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Mudança A: commitAll stages legit work but does not stage unplanned internal trees", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "internal runtime state\n"); // unstaged internal
+    await writeFile(join(dir, "source.ts"), "task work\n");
+    gStage(dir, "source.ts"); // legit staged work
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.commit, `legit staged work must commit, got: ${c.error}`);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("source.ts"));
+    assert.ok(!committed.includes(".oae/state.json"), "internal tree must not enter the commit");
+    // the internal artifact stays untracked in the working tree, untouched
+    // (porcelain collapses an untracked DIRECTORY to the bare dir path)
+    assert.ok(gStagedSnapshot(dir).includes("?? .oae/\0"), "internal file left untracked");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard fails closed when the index cannot be read", async () => {
+  const dir = await makeProject();
+  try {
+    // not a git repository: git status cannot read anything → must refuse to vouch
+    await assert.rejects(() => assertNoInternalArtifactsStaged(dir), /cannot read the git index safely/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("Mudança B: new-repo baseline commit includes user files, excludes internal trees", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]); // no commits yet
+    await writeFile(join(dir, "user.txt"), "user work\n"); // unstaged user work
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "internal\n"); // unstaged internal (created pre-prepareGit in real flow)
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.status.hasCommits, "baseline commit exists");
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("user.txt"), "user files are part of the new-repo baseline");
+    assert.ok(!committed.includes(".oae/state.json"), "internal trees are excluded from the baseline commit");
+    assert.ok(gStagedSnapshot(dir).includes("?? .oae/\0"), "internal artifact still untracked afterwards");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard covers the baseline commit path: pre-staged internal blocks prepareGit, no commit, index intact", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]); // no commits yet
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "pre-staged internal\n");
+    gStage(dir, ".oae/state.json"); // user pre-staged an internal artifact
+    await writeFile(join(dir, "user.txt"), "user work\n");
+    const before = gStagedSnapshot(dir);
+
+    await assert.rejects(
+      () => prepareGit(dir),
+      err => err instanceof InternalArtifactsStagedError && err.paths.includes(".oae/state.json"),
+    );
+    assert.equal(gCommitCount(dir), 0, "no baseline commit happened");
+    assert.equal(gStagedSnapshot(dir), before, "index content identical when blocked");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard covers the task-commit path alone (no orchestrator): blocked commit returns error, HEAD unchanged", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await writeFile(join(dir, "task-change.ts"), "task work\n");
+    gRun(dir, ["add", "-A", "--", ...INTERNAL_EXCLUDE_PATHSPECS]); // the add that commitAll would run
+    await mkdir(join(dir, ".opencode"), { recursive: true });
+    await writeFile(join(dir, ".opencode", "plugin.js"), "internal\n");
+    gStage(dir, ".opencode/plugin.js"); // pre-staged after the add → only the guard can catch it
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.error && c.error.includes(".opencode/plugin.js"), `guard lists .opencode path, got: ${c.error}`);
+    assert.ok(!c.commit, "nothing was committed");
+    assert.equal(gCommitCount(dir), 1, "HEAD unchanged (base commit only)");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.1 T7 (orchestrator): pre-staged internal artifact blocks the run's task commit with explicit diagnosis; pre-existing staging preserved", async () => {
+  const dir = await makeProject();
+  const { execFileSync: ex } = await import("node:child_process");
+  try {
+    // repo with one commit and an internal artifact STAGED BEFORE the run (user's pre-existing state)
+    gRun(dir, ["init", "-b", "main"]);
+    gBaseCommit(dir);
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "pre-existing user-staged internal\n");
+    gStage(dir, ".oae/state.json");
+    const beforeCommits = gCommitCount(dir);
+    const beforeZ = gStagedSnapshot(dir);
+
+    const config = fastRecovery(await loadConfig(dir));
+    config.validators = [{ name: "noop", cmd: "node", args: ["-e", "0"] }];
+    const store = await Store.create(dir, "run-t7", "t7 regression");
+    const orch = new Orchestrator(null, store, {
+      config,
+      plan: plan1(dir),
+      runnerFactory: (kind) => (kind === "coder" ? FACTORY_OK_CODER() : new FakeRunner("s-rev", { type: "complete", output: REVIEWER_OK })),
+    });
+    const { state } = await orch.run("t7 regression");
+    const blockedTasks = state.tasks.filter((t) => t.status === "blocked");
+    assert.ok(blockedTasks.length > 0, "at least one task is blocked by the guard");
+    for (const t of blockedTasks) {
+      assert.ok(!t.commit, "no commit hash recorded when the guard blocked");
+      assert.ok((t.blockedReason ?? "").includes("commit failed"), `blockedReason: ${t.blockedReason}`);
+    }
+    assert.ok(
+      state.decisions.some((d) => d.text.includes("Commit failed for task") && d.rationale?.includes("internal artifacts are staged")),
+      "decision records the guard diagnosis",
+    );
+    // pre-existing state preserved: no commit, and the STAGED SET is exactly
+    // as before the run (the internal artifact is still staged untouched)
+    assert.equal(gCommitCount(dir), beforeCommits, "no OAE commit happened");
+    const stagedPathsOf = (porcelain: string) =>
+      porcelain.split("\0").filter((l) => {
+        const x = l[0];
+        return l.length >= 4 && x !== " " && x !== "?" && x !== "!"; // staged entries (X column)
+      }).map((l) => l.slice(3)).sort();
+    const afterStatus = gRun(dir, ["status", "--porcelain=v1"]);
+    const afterZ = gStagedSnapshot(dir);
+    const beforeStaged = stagedPathsOf(beforeZ);
+    const afterStaged = stagedPathsOf(afterZ);
+    assert.deepEqual(afterStaged, beforeStaged, "staged PATHS unchanged when the guard blocked (OAE's runtime may rewrite internal files in the worktree, but the index content is untouched)");
+    assert.ok(beforeStaged.includes(".oae/state.json"), ".oae/state.json was pre-staged");
+    void ex;
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0.1.1 — targeted guard corrections (from the independent review):
+//  * 'T' (type change) is a documented porcelain v1 status and must be
+//    accepted, blocking only when the path is inside the internal trees;
+//  * truncated output (missing terminating NUL) must fail closed;
+//  * the blocked-commit diagnostic must be compact and self-limiting.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("guard diagnostic: many internal paths are summarized compactly", () => {
+  const paths = Array.from({ length: 30 }, (_, i) => `.oae/f${i}.json`);
+  const err = new InternalArtifactsStagedError(paths);
+  assert.match(err.message, /30 internal path\(s\) total/, "diagnostic states the total count");
+  assert.match(err.message, /showing the first 8/, "diagnostic bounds the sample");
+  assert.ok(err.message.includes(".oae/f7.json"), "sample paths are listed");
+  assert.ok(!err.message.includes(".oae/f8.json"), "paths outside the sample are omitted, not truncated mid-path");
+  assert.equal(err.paths.length, 30, "structured paths stay available for tooling");
+  assert.ok(err.message.length <= 500, "message fits the legacy channel cap without truncation of the sample");
+});
+
+// Symlink-based typechange fixtures rely on POSIX semantics; skipped on Windows.
+test("guard: staged typechange on a legit path does not block the commit", { skip: process.platform === "win32" }, async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    // HEAD records a symlink at link.txt
+    await symlink("placeholder", join(dir, "link.txt"));
+    gStage(dir, "link.txt");
+    gBaseCommit(dir);
+    assert.equal(gStagedSnapshot(dir), "", "sanity: repo is clean after the base commit");
+    // replace the symlink with a regular file and stage → staged typechange
+    await rm(join(dir, "link.txt"));
+    await writeFile(join(dir, "link.txt"), "now a regular file\n");
+    gStage(dir, "link.txt");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes("T  link.txt\0"), `fixture must produce a documented T record, got: ${JSON.stringify(snap)}`);
+    // plus additional legit work so the commit is non-vacuous
+    await writeFile(join(dir, "extra.txt"), "task work\n");
+    gStage(dir, "extra.txt");
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.commit, `a staged typechange on a legitimate path must not block, got: ${c.error}`);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("link.txt"), "the typechange is part of the commit");
+    assert.ok(committed.includes("extra.txt"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard: staged typechange inside .oae/ still blocks the commit", { skip: process.platform === "win32" }, async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    // HEAD records an internal symlink (e.g. committed in a previous buggy era)
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await symlink("old", join(dir, ".oae", "link"));
+    gStage(dir, ".oae/link");
+    gBaseCommit(dir);
+    // replace with a regular file and stage → T record on an internal path
+    await rm(join(dir, ".oae", "link"));
+    await writeFile(join(dir, ".oae", "link"), "now a regular file\n");
+    gStage(dir, ".oae/link");
+    const before = gStagedSnapshot(dir);
+    const beforeCommits = gCommitCount(dir);
+    assert.ok(before.includes("T  .oae/link\0"), `fixture must produce a documented T record, got: ${JSON.stringify(before)}`);
+
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(c.error && c.error.includes(".oae/link"), `internal typechange must block, got: ${c.error}`);
+    assert.match(c.error!, /internal artifacts are staged/);
+    assert.ok(!c.commit, "nothing was committed");
+    assert.equal(gCommitCount(dir), beforeCommits, "no new commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index identical when blocked");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("guard: empty status output is the legitimate clean case (no blocking)", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "work.txt"), "task work\n");
+    gStage(dir, "work.txt");
+    gBaseCommit(dir); // clean status afterwards → guard reads empty output
+    assert.equal(gStagedSnapshot(dir), "", "fixture: clean status yields empty output");
+    const c = await commitAll(dir, "oae(task-1): change code");
+    assert.ok(!c.commit, "nothing staged → no commit (legacy no-op)");
+    assert.ok(!c.error, "the tolerated no-op carries no error — the guard accepted the empty output twice");
+    // the guard itself must accept empty output explicitly
+    assert.deepEqual(parseStagedPathsFromStatusZ(""), []);
+    await assert.doesNotReject(() => assertNoInternalArtifactsStaged(dir), "empty (clean) output must not panic the guard");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0.2 — baseline reading, restore-path selection and a verified, one-shot
+// index restore. Real git in throwaway repositories; deterministic failure
+// comes from the module-level git seam (setGitExecForTest) — never from
+// corrupting a real repository. Every seam install is reset in a finally.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const p02Git = await import("../src/git.ts");
+const { setGitExecForTest, parseStatusRecordsZ, GitBaselineRestoreError } = p02Git;
+const { runCommand } = await import("../src/util.ts");
+
+/** Seed a real repo: main branch, one base commit ("original\n" in tracked.txt). */
+async function p02Seed(dir: string): Promise<void> {
+  gRun(dir, ["init", "-b", "main"]);
+  await writeFile(join(dir, "tracked.txt"), "original\n");
+  gStage(dir, "tracked.txt");
+  gBaseCommit(dir);
+  assert.equal(gStagedSnapshot(dir), "", "fixture must start clean");
+}
+
+test("P0.2 parser: parseStatusRecordsZ returns complete records", () => {
+  const p = parseStatusRecordsZ;
+  assert.deepEqual(p(""), []);
+  assert.deepEqual(p("A  b.txt\0"), [{ x: "A", y: " ", path: "b.txt" }]);
+  assert.deepEqual(p(" M a.txt\0"), [{ x: " ", y: "M", path: "a.txt" }]);
+  assert.deepEqual(p("?? c.txt\0"), [{ x: "?", y: "?", path: "c.txt" }]);
+  assert.deepEqual(p("UU merge.txt\0"), [{ x: "U", y: "U", path: "merge.txt" }]);
+  assert.deepEqual(p("T  x.txt\0"), [{ x: "T", y: " ", path: "x.txt" }]);
+  assert.deepEqual(
+    p("R  moved.ts\0tomove.ts\0 M a.ts\0"),
+    [{ x: "R", y: " ", path: "moved.ts", orig: "tomove.ts" }, { x: " ", y: "M", path: "a.ts" }],
+    "-z emits 'to from' for renames; following records stay aligned",
+  );
+  // fail-closed grammar preserved (same cases the P0.1.1 parser throws on)
+  assert.throws(() => p("R  moved.ts\0"), /truncated|original/);
+  assert.throws(() => p("zz a.txt\0"), /malformed/);
+  assert.throws(() => p("M  \0"), /empty path|malformed/);
+  assert.throws(() => p("M  a\0MM b"), /truncated/);
+});
+
+test("P0.2 baseline: user work (incl. .oae-notes, UTF-8, spaces, brackets) is restored and never committed; internal trees stay out of the list", async () => {
+  const dir = await makeProject();
+  try {
+    await p02Seed(dir);
+    // user work in every baseline flavor
+    await writeFile(join(dir, ".oae-notes"), "agent notes are USER work\n"); // untracked look-alike
+    await writeFile(join(dir, "ção utf8 espaço.txt"), "utf8 content\n"); // UTF-8 + spaces + untracked
+    await writeFile(join(dir, "a[1].txt"), "brackets\n"); // pathspec special chars + untracked
+    await writeFile(join(dir, "staged-user.txt"), "user work\n");
+    gStage(dir, "staged-user.txt"); // user-staged pre-run
+    await writeFile(join(dir, "tracked.txt"), "user edit\n"); // unstaged modification of the base commit
+    // internal trees, unstaged (what a real run's .oae/ state would look like)
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "internal\n");
+    await mkdir(join(dir, ".opencode"), { recursive: true });
+    await writeFile(join(dir, ".opencode", "x.md"), "internal\n");
+
+    const prep = await prepareGit(dir);
+    const list = prep.baselineUncommitted;
+    // every flavor of user work is on the restore list, quoted-free and literal
+    assert.ok(list.includes(".oae-notes"), '.oae-notes is user work — the old startsWith(".oae") must never drop it');
+    assert.ok(list.includes("ção utf8 espaço.txt"), "UTF-8 + spaces arrive as the literal path (B1)");
+    assert.ok(list.includes("a[1].txt"), "pathspec-sensitive characters arrive literal");
+    assert.ok(list.includes("staged-user.txt"), "user-staged entries are demoted (policy §6.3a)");
+    assert.ok(list.includes("tracked.txt"), "unstaged modifications return to unstaged after restore");
+    // …and the internal trees are not
+    assert.ok(!list.some((p) => isInternalArtifactPath(p)), "internal trees are excluded from the restore list");
+    // structured records carry the same facts
+    assert.ok(prep.status.records!.some((r) => r.path === "ção utf8 espaço.txt" && r.x === "?"), "structured record with the literal path");
+    assert.ok(prep.status.uncommitted.includes("?? a[1].txt"), "uncommitted text is derived from the records");
+    assert.ok(prep.status.uncommitted.some((s) => s === " M tracked.txt"), "unstaged record keeps the porcelain form");
+
+    // the task's own work
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const c = await commitAll(dir, "oae(p02-1): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore must succeed for every baseline flavor, got: ${c.error}`);
+    assert.ok(c.commit && /^[0-9a-f]{40}$/.test(c.commit));
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"), "the task work is committed");
+    for (const p of [".oae-notes", "ção utf8 espaço.txt", "a[1].txt", "staged-user.txt", "tracked.txt"]) {
+      assert.ok(!committed.includes(p), `${p} must not be in the task commit`);
+    }
+    // worktree content preserved in every case
+    assert.equal(await readFile(join(dir, ".oae-notes"), "utf8"), "agent notes are USER work\n");
+    assert.equal(await readFile(join(dir, "ção utf8 espaço.txt"), "utf8"), "utf8 content\n");
+    assert.equal(await readFile(join(dir, "a[1].txt"), "utf8"), "brackets\n");
+    assert.equal(await readFile(join(dir, "staged-user.txt"), "utf8"), "user work\n");
+    assert.equal(await readFile(join(dir, "tracked.txt"), "utf8"), "user edit\n");
+    // nothing staged after the commit; user work back to its baseline shapes
+    const snap = gStagedSnapshot(dir);
+    assert.ok(parseStatusRecordsZ(snap).every((r) => r.x === " " || r.x === "?"), "no staged user work after the commit");
+    assert.ok(snap.includes("?? .oae-notes\0") && snap.includes(" M tracked.txt\0") && snap.includes("?? a[1].txt\0"));
+    assert.ok(snap.includes("?? .oae/"), "internal trees stay untracked");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2 baseline: pre-staged .oae-notes is demoted out of the task commit (§6.3a), content preserved", async () => {
+  const dir = await makeProject();
+  try {
+    await p02Seed(dir);
+    await writeFile(join(dir, ".oae-notes"), "notes staged before the run\n");
+    gStage(dir, ".oae-notes"); // pre-existing staged user work
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes(".oae-notes"), "staged .oae-notes belongs to the baseline restore list");
+
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const c = await commitAll(dir, "oae(p02-2): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore must succeed, got: ${c.error}`);
+    assert.ok(c.commit);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"));
+    assert.ok(!committed.includes(".oae-notes"), "pre-staged user work must not enter the task commit");
+    assert.equal(await readFile(join(dir, ".oae-notes"), "utf8"), "notes staged before the run\n", "content preserved");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes("?? .oae-notes\0"), "demoted back to untracked, not deleted");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2 restore: staged deletion and typechange are restored without silent errors", { skip: process.platform === "win32" }, async () => {
+  const dir = await makeProject();
+  try {
+    await p02Seed(dir);
+    // two more tracked files
+    await writeFile(join(dir, "todel.txt"), "delete me\n");
+    await writeFile(join(dir, "typechange.txt"), "will become a symlink\n");
+    gStage(dir, "todel.txt", "typechange.txt");
+    gBaseCommit(dir);
+    assert.equal(gStagedSnapshot(dir), "", "fixture: clean start");
+
+    // staged deletion → "D  todel.txt"; staged typechange → "T  typechange.txt"
+    await rm(join(dir, "todel.txt"));
+    gStage(dir, "todel.txt");
+    await rm(join(dir, "typechange.txt"));
+    await symlink("link-target", join(dir, "typechange.txt"));
+    gStage(dir, "typechange.txt");
+    const before = gStagedSnapshot(dir);
+    assert.ok(before.includes("D  todel.txt\0") && before.includes("T  typechange.txt\0"), `fixture must record D and T: ${JSON.stringify(before)}`);
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("todel.txt") && prep.baselineUncommitted.includes("typechange.txt"), "both D and T paths are on the restore list");
+
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const c = await commitAll(dir, "oae(p02-3): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore of D/T must not fail silently, got: ${c.error}`);
+    assert.ok(c.commit);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"));
+    assert.ok(!committed.includes("todel.txt") && !committed.includes("typechange.txt"), "D/T baseline work stays out of the commit");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes(" D todel.txt\0"), "deletion demoted back to unstaged");
+    assert.ok(snap.includes(" T typechange.txt\0"), "typechange demoted back to unstaged");
+    assert.ok(parseStatusRecordsZ(snap).every((r) => r.x === " " || r.x === "?"), "nothing staged after the commit");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2 restore: staged renames are restored through BOTH paths in one call", async () => {
+  const dir = await makeProject();
+  try {
+    await p02Seed(dir);
+    await writeFile(join(dir, "tomove.txt"), "moving along\n");
+    gStage(dir, "tomove.txt");
+    gBaseCommit(dir);
+    gRun(dir, ["mv", "tomove.txt", "moved.txt"]); // git mv stages the rename
+    const before = gStagedSnapshot(dir);
+    assert.ok(before.includes("R  moved.txt\0tomove.txt\0"), `fixture must record a staged rename: ${JSON.stringify(before)}`);
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("moved.txt") && prep.baselineUncommitted.includes("tomove.txt"), "restore list contains BOTH sides of the rename");
+    assert.ok(prep.status.uncommitted.includes("R  tomove.txt -> moved.txt"), "the derived uncommitted text uses orig -> path");
+
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const c = await commitAll(dir, "oae(p02-4): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore of the rename pair must not fail silently, got: ${c.error}`);
+    assert.ok(c.commit);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"));
+    assert.ok(!committed.includes("moved.txt") && !committed.includes("tomove.txt"), "neither rename side enters the task commit");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes(" D tomove.txt\0") && snap.includes("?? moved.txt\0"), "rename pair returns to 'delete old + untracked new'");
+    assert.equal(await readFile(join(dir, "moved.txt"), "utf8"), "moving along\n", "moved content preserved");
+    await assert.rejects(() => readFile(join(dir, "tomove.txt"), "utf8"), "old path stays gone (worktree reality untouched)");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2 restore: injected failure blocks the commit with a typed diagnosis and no destructive cleanup", async () => {
+  const dir = await makeProject();
+  try {
+    await p02Seed(dir);
+    await writeFile(join(dir, "staged-user.txt"), "user work\n");
+    gStage(dir, "staged-user.txt");
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("staged-user.txt"));
+
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git" && args[0] === "restore") {
+        return Promise.resolve({
+          code: 1,
+          stdout: "",
+          stderr: "error: pathspec 'staged-user.txt' did not match any file(s) known to git (simulated)",
+          timedOut: false,
+        });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(p02-5): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest(); // never leak the stub into later tests
+    }
+    assert.ok(!c.commit, "the commit is blocked by the restore failure");
+    assert.ok(c.error);
+    assert.match(c.error, /baseline restore failed \(git restore --staged, exit 1\)/, "typed diagnosis");
+    assert.match(c.error, /staged-user\.txt/, "the failing path is named in the diagnostic");
+    assert.match(c.error, /A  staged-user\.txt/, "the index snapshot at failure time is part of the diagnosis");
+    assert.ok(new GitBaselineRestoreError(["x"], 1, "e", "s").paths.length === 1, "typed error carries structured fields");
+    // deterministic: exactly one restore invocation for the whole baseline
+    assert.equal(calls.filter((a) => a[0] === "restore").length, 1, "one restore invocation for the whole baseline");
+    // no destructive cleanup was ever issued
+    assert.ok(!calls.some((a) => a[0] === "reset" || (a[0] === "rm" && a[1] === "--cached")), "no git reset / rm --cached was executed");
+    // the failure left the index exactly as our add produced it: baseline entry still staged, work intact
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes("A  staged-user.txt\0"), "user's staged entry intact after the failed restore (no demotion, no reset)");
+    assert.ok(snap.includes("A  feature.txt\0"), "task work intact, uncommitted");
+    assert.equal(await readFile(join(dir, "staged-user.txt"), "utf8"), "user work\n", "worktree content preserved");
+    assert.equal(await readFile(join(dir, "feature.txt"), "utf8"), "task work\n");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2 no-commits branch: baseline commit refreshes state, no stale restore list (B5)", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]); // repo without commits
+    await writeFile(join(dir, "user.txt"), "user work\n");
+    await writeFile(join(dir, ".oae-notes"), "notes are user work\n");
+    await mkdir(join(dir, ".oae"), { recursive: true });
+    await writeFile(join(dir, ".oae", "state.json"), "internal\n");
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.status.hasCommits, "baseline commit created");
+    // B5: the baseline commit committed all non-internal user work; returning
+    // the pre-baseline records here would restore already-committed paths.
+    assert.deepEqual(prep.baselineUncommitted, [], "no stale restore list after the baseline commit");
+    const base = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(base.includes("user.txt") && base.includes(".oae-notes"), "user work is part of the new-repo baseline (existing policy)");
+    assert.ok(!base.includes(".oae/state.json"), "internal trees stay out of the baseline commit");
+    assert.ok(gStagedSnapshot(dir).includes("?? .oae/\0"), "internal artifact still untracked afterwards");
+
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const c = await commitAll(dir, "oae(p02-6): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `empty baseline must not even invoke restore, got: ${c.error}`);
+    assert.ok(c.commit);
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"), "task commit succeeds");
+    assert.ok(!committed.includes("user.txt"), "baseline work is not committed twice");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0.2.1 — A1 (pending merge/rebase/cherry-pick/revert), A3 (staging exit
+// code), A2 (rename exclusion in changedFiles). Real git in throwaway
+// repositories; deterministic failures via the existing git seam. Git state
+// files are only ever READ; every injected seam is reset in a finally block.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const p021 = await import("../src/git.ts");
+const { GitPendingOperationError, GitStagingError, assertNoPendingGitOperations } = p021;
+const { existsSync } = await import("node:fs");
+
+/**
+ * Seed: main + diverged `side` with a conflicting edit of f.txt, then START
+ * the requested operation and leave it UNRESOLVED (conflict markers on disk),
+ * exactly like the probes of the P0.2.1 audit.
+ */
+async function p021Pending(dir: string, kind: "merge" | "rebase" | "cherry-pick"): Promise<number> {
+  gRun(dir, ["init", "-b", "main"]);
+  await writeFile(join(dir, "f.txt"), "base\n");
+  gStage(dir, "f.txt");
+  gBaseCommit(dir);
+  gRun(dir, ["checkout", "-b", "side"]);
+  await writeFile(join(dir, "f.txt"), "side\n");
+  gStage(dir, "f.txt");
+  gRun(dir, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "side"]);
+  gRun(dir, ["checkout", "main"]);
+  await writeFile(join(dir, "f.txt"), "main\n");
+  gStage(dir, "f.txt");
+  gRun(dir, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "main"]);
+  const commits = gCommitCount(dir);
+  gRun(dir, ["checkout", kind === "rebase" ? "side" : "main"]);
+  try {
+    if (kind === "merge") gRun(dir, ["merge", "side"]);
+    if (kind === "cherry-pick") gRun(dir, ["cherry-pick", "side"]);
+    if (kind === "rebase") gRun(dir, ["rebase", "main"]);
+    throw new Error(`fixture: ${kind} must conflict, but exited clean`);
+  } catch (e) {
+    if (String(e).includes("must conflict")) throw e; // fixture sanity failure
+    // non-zero exit = the gRun at-fault behavior carrying the conflict exit
+  }
+  return Promise.resolve(commits);
+}
+
+test("P0.2.1 A1: pending merge blocks commitAll, MERGE_HEAD and index untouched", async () => {
+  const dir = await makeProject();
+  try {
+    const commits = await p021Pending(dir, "merge");
+    assert.ok(existsSync(join(dir, ".git", "MERGE_HEAD")), "fixture: merge pending");
+    const snapBefore = gStagedSnapshot(dir);
+    // the typed gate itself
+    await assert.rejects(assertNoPendingGitOperations(dir), (e: unknown) => {
+      assert.ok(e instanceof GitPendingOperationError, "typed error");
+      assert.equal(e.queryFailed, false);
+      assert.ok(e.ops.some((o: string) => o.includes("merge")), `ops name the pending operation: ${JSON.stringify(e.ops)}`);
+      return true;
+    });
+    const c = await commitAll(dir, "oae(p021): change code");
+    assert.ok(!c.commit, "the commit is blocked");
+    assert.match(c.error!, /still pending/);
+    assert.match(c.error!, /MERGE_HEAD/, "the diagnostic names the pending operation");
+    assert.match(c.error!, /left untouched/);
+    assert.equal(gCommitCount(dir), commits, "no commit was created by OAE");
+    assert.equal(gStagedSnapshot(dir), snapBefore, "index untouched by the blocked attempt");
+    assert.ok(existsSync(join(dir, ".git", "MERGE_HEAD")), "the user's pending merge state survives intact");
+    // conflict-marker content preserved on disk (only READ here)
+    assert.ok((await readFile(join(dir, "f.txt"), "utf8")).includes("<<<<<<<"), "worktree conflict markers preserved");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A1: pending rebase blocks commitAll, rebase state intact", async () => {
+  const dir = await makeProject();
+  try {
+    const commits = await p021Pending(dir, "rebase");
+    const stateDir = existsSync(join(dir, ".git", "rebase-merge")) ? "rebase-merge" : "rebase-apply";
+    assert.ok(existsSync(join(dir, ".git", stateDir)), "fixture: rebase pending");
+    const snapBefore = gStagedSnapshot(dir);
+    const c = await commitAll(dir, "oae(p021): change code");
+    assert.ok(!c.commit, "the commit is blocked during a pending rebase");
+    assert.match(c.error!, /still pending/);
+    assert.match(c.error!, /rebase/);
+    assert.equal(gCommitCount(dir), commits, "no commit was created");
+    assert.equal(gStagedSnapshot(dir), snapBefore, "index untouched");
+    assert.ok(existsSync(join(dir, ".git", stateDir)), "the user's rebase state survives intact");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A1: pending cherry-pick blocks commitAll, CHERRY_PICK_HEAD intact", async () => {
+  const dir = await makeProject();
+  try {
+    const commits = await p021Pending(dir, "cherry-pick");
+    assert.ok(existsSync(join(dir, ".git", "CHERRY_PICK_HEAD")), "fixture: cherry-pick pending");
+    const snapBefore = gStagedSnapshot(dir);
+    const c = await commitAll(dir, "oae(p021): change code");
+    assert.ok(!c.commit, "the commit is blocked during a pending cherry-pick");
+    assert.match(c.error!, /still pending/);
+    assert.match(c.error!, /cherry-pick/);
+    assert.equal(gCommitCount(dir), commits, "no commit was created");
+    assert.equal(gStagedSnapshot(dir), snapBefore, "index untouched");
+    assert.ok(existsSync(join(dir, ".git", "CHERRY_PICK_HEAD")), "the user's cherry-pick state survives intact");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A1: unanswerable pending-state query blocks the commit (fail-closed)", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "a.txt"), "one\n");
+    gStage(dir, "a.txt");
+    gBaseCommit(dir);
+    const before = gStagedSnapshot(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      // degrade ONLY the pending-state probes; every other command stays real
+      if (cmd === "git" && args[0] === "rev-parse" && (args.includes("--git-path") || args.includes("--verify"))) {
+        return Promise.resolve({ code: 1, stdout: "", stderr: "fatal: bad object (simulated)", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(p021): change code");
+    } finally {
+      setGitExecForTest(); // never leak the stub
+    }
+    assert.ok(!c.commit, "the commit is blocked while the repo state cannot be proven clean");
+    assert.match(c.error!, /could not be determined/);
+    assert.match(c.error!, /query failed/);
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index untouched by the blocked attempt");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A3: git add failure aborts before any restore or commit", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "tracked.txt"), "original\n");
+    gStage(dir, "tracked.txt");
+    gBaseCommit(dir); // clean base → subsequent user work is captured by the baseline
+    await writeFile(join(dir, "untracked.txt"), "user untracked\n"); // restore-list candidate
+    await writeFile(join(dir, "staged-user.txt"), "user work\n");
+    gStage(dir, "staged-user.txt");
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("staged-user.txt") && prep.baselineUncommitted.includes("untracked.txt"));
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+    const before = gStagedSnapshot(dir);
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git" && args[0] === "add") {
+        return Promise.resolve({ code: 1, stdout: "", stderr: "fatal: index.lock: Permission denied (simulated)", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(p021-3): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest(); // never leak the stub
+    }
+    assert.ok(!c.commit, "no commit after a staging failure");
+    assert.match(c.error!, /staging failed \(git add, exit 1\)/);
+    assert.match(c.error!, /Permission denied/);
+    assert.ok(calls.filter((a) => a[0] === "restore").length === 0, "restoreBaseline must NOT be attempted after staging fails");
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index untouched by the failed staging attempt — no demotion ran");
+    assert.equal(await readFile(join(dir, "staged-user.txt"), "utf8"), "user work\n", "worktree preserved");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A2: baseline staged rename excluded from changedFiles; task change kept", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "tomove.txt"), "moved by user\n");
+    gStage(dir, "tomove.txt");
+    gBaseCommit(dir);
+    gRun(dir, ["mv", "tomove.txt", "moved.txt"]); // pre-existing staged rename
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("tomove.txt") && prep.baselineUncommitted.includes("moved.txt"), "both rename sides are baseline");
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+
+    const { changedFiles } = await import("../src/orchestrator.ts");
+    const files = await changedFiles(dir, prep.baselineUncommitted);
+    assert.ok(!files.includes("tomove.txt -> moved.txt"), "the pre-existing rename must not leak into changedFiles");
+    assert.ok(files.includes("feature.txt"), "genuine task work stays visible");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("P0.2.1 A2: rename exclusion normalization (contract mocks)", async () => {
+  const { changedFiles } = await import("../src/orchestrator.ts");
+  // both endpoints on the baseline list ⇒ combined rename entry is excluded
+  assert.deepEqual(await changedFiles("/proj", ["old.txt", "new.txt"], gitStatusMock(["R  old.txt -> new.txt"])), []);
+  // single-endpoint match ⇒ kept: a genuine task rename must never be hidden
+  assert.deepEqual(
+    await changedFiles("/proj", ["old.txt", "other.txt"], gitStatusMock(["R  old.txt -> new-task.txt"])),
+    ["old.txt -> new-task.txt"],
+  );
+  // a baseline path renamed BY the task to a fresh name stays visible (UTF-8 + spaces too)
+  assert.deepEqual(
+    await changedFiles("/proj", ["new-task.txt", "ação.txt"], gitStatusMock(["R  old-task.txt -> new-task.txt", " M untou chedção.txt"])),
+    ["old-task.txt -> new-task.txt", "untou chedção.txt"],
+  );
+  // the literal legacy string still matches directly
+  assert.deepEqual(await changedFiles("/proj", ["old.txt -> new.txt"], gitStatusMock(["R  old.txt -> new.txt"])), []);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C1 — inspectGit fail-closed: a failed `git status` read is NEVER reported as
+// a clean repository (non-zero exit, spawn failure or timeout must throw, not
+// silently produce empty uncommitted/records lists). Deterministic injection
+// through the same module-level seam (setGitExecForTest); every install is
+// reset in finally. No real repository is touched — the stub answers every
+// probe inspectGit makes and rejects anything unexpected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const { GitStatusReadError } = p02Git;
+/** The destructured binding is a value, not a type name — this alias gives the instance type for `as` casts. */
+type GitStatusReadErrorT = InstanceType<typeof GitStatusReadError>;
+
+const FAKE_PROJ = "/oae-c1-probe/not-a-real-dir";
+const FAKE_HEAD = `${"a".repeat(40)}\n`;
+
+/** Full stub for inspectGit's probe sequence; only the `status` answer varies per case. */
+function stubInspectGit(status: { code: number | null; stdout: string; stderr: string; timedOut: boolean }) {
+  return (cmd: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => {
+    if (cmd === "git") {
+      if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+        return Promise.resolve({ code: 0, stdout: "true\n", stderr: "", timedOut: false });
+      }
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
+        return Promise.resolve({ code: 0, stdout: "main\n", stderr: "", timedOut: false });
+      }
+      if (args[0] === "rev-parse" && args[1] === "HEAD") {
+        return Promise.resolve({ code: 0, stdout: FAKE_HEAD, stderr: "", timedOut: false });
+      }
+      if (args[0] === "remote") {
+        return Promise.resolve({ code: 0, stdout: "https://example.com/oae-probe.git\n", stderr: "", timedOut: false });
+      }
+      if (args[0] === "status") {
+        return Promise.resolve({ ...status });
+      }
+    }
+    return Promise.reject(new Error(`C1 stub: unexpected git invocation: ${cmd} ${args.join(" ")}`));
+  };
+}
+
+test("C1 inspectGit: git status exit 128 fails closed with a typed error (never an empty clean report)", async () => {
+  setGitExecForTest(stubInspectGit({ code: 128, stdout: "", stderr: "fatal: unable to read the index (simulated)", timedOut: false }));
+  let captured: unknown;
+  try {
+    await assert.rejects(
+      () => inspectGit(FAKE_PROJ),
+      (e: unknown) => { captured = e; return e instanceof GitStatusReadError; },
+      "a non-zero status exit must throw, not return empty lists",
+    );
+  } finally {
+    setGitExecForTest(); // never leak the stub
+  }
+  const err = captured as GitStatusReadErrorT;
+  assert.equal(err.code, 128);
+  assert.equal(err.timedOut, false);
+  assert.match(err.message, /git-state read failed \(git status --porcelain=v1 -z, exit 128\)/);
+  assert.match(err.message, /fail-closed/);
+  assert.match(err.message, /unable to read the index/);
+  assert.ok(err.message.length <= 500, "diagnostic is self-limiting");
+});
+
+test("C1 inspectGit: git status code null (spawn failure) fails closed", async () => {
+  setGitExecForTest(stubInspectGit({ code: null, stdout: "", stderr: "spawn git ENOENT (simulated)", timedOut: false }));
+  let captured: unknown;
+  try {
+    await assert.rejects(
+      () => inspectGit(FAKE_PROJ),
+      (e: unknown) => { captured = e; return e instanceof GitStatusReadError; },
+    );
+  } finally {
+    setGitExecForTest();
+  }
+  const err = captured as GitStatusReadErrorT;
+  assert.equal(err.code, null);
+  assert.match(err.message, /exit null/);
+  assert.match(err.message, /fail-closed/);
+});
+
+test("C1 inspectGit: git status timeout fails closed (timedOut:true with code 0 AND with code null)", async () => {
+  for (const code of [0, null]) {
+    setGitExecForTest(stubInspectGit({ code, stdout: "", stderr: "", timedOut: true }));
+    let captured: unknown;
+    try {
+      await assert.rejects(
+        () => inspectGit(FAKE_PROJ),
+        (e: unknown) => { captured = e; return e instanceof GitStatusReadError; },
+        `timedOut:true with code ${code} must throw`,
+      );
+    } finally {
+      setGitExecForTest();
+    }
+    const err = captured as GitStatusReadErrorT;
+    assert.equal(err.timedOut, true, `timedOut flag carried (code ${code})`);
+    assert.match(err.message, /timed out/);
+    assert.match(err.message, /fail-closed/);
+  }
+});
+
+test("C1 inspectGit: clean status (empty stdout, exit 0) is the legitimate clean case and does NOT throw", async () => {
+  setGitExecForTest(stubInspectGit({ code: 0, stdout: "", stderr: "", timedOut: false }));
+  let st: Awaited<ReturnType<typeof inspectGit>>;
+  try {
+    st = await inspectGit(FAKE_PROJ);
+  } finally {
+    setGitExecForTest();
+  }
+  assert.equal(st.isRepo, true);
+  assert.equal(st.branch, "main");
+  assert.equal(st.remote, "https://example.com/oae-probe.git");
+  assert.deepEqual(st.uncommitted, [], "empty stdout with exit 0 = clean work tree");
+  assert.deepEqual(st.records, []);
+  assert.equal(st.head, FAKE_HEAD.trim());
+  assert.equal(st.hasCommits, true);
+});
+
+test("C1 inspectGit: valid status with changes parses records and derived uncommitted text (incl. rename to\\0from)", async () => {
+  setGitExecForTest(stubInspectGit({ code: 0, stdout: " M file.txt\0R  new.txt\0old.txt\0", stderr: "", timedOut: false }));
+  let st: Awaited<ReturnType<typeof inspectGit>>;
+  try {
+    st = await inspectGit(FAKE_PROJ);
+  } finally {
+    setGitExecForTest();
+  }
+  assert.deepEqual(st.records, [
+    { x: " ", y: "M", path: "file.txt" },
+    { x: "R", y: " ", path: "new.txt", orig: "old.txt" },
+  ], "-z rename record carries to/from as separate fields");
+  assert.deepEqual(st.uncommitted, [
+    " M file.txt",
+    "R  old.txt -> new.txt",
+  ], "uncommitted text keeps the porcelain form and the orig -> path rename form");
+});
+
+test("C1 inspectGit: exit 0 with uninterpretable porcelain output also fails closed (wrapped typed error)", async () => {
+  setGitExecForTest(stubInspectGit({ code: 0, stdout: "zz broken\0", stderr: "", timedOut: false }));
+  let captured: unknown;
+  try {
+    await assert.rejects(
+      () => inspectGit(FAKE_PROJ),
+      (e: unknown) => { captured = e; return e instanceof GitStatusReadError; },
+      "malformed porcelain output must never be reported as a clean tree",
+    );
+  } finally {
+    setGitExecForTest();
+  }
+  const err = captured as GitStatusReadErrorT;
+  assert.match(err.message, /uninterpretable porcelain output/);
+  assert.match(err.message, /malformed/);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C2/C3 — baseline-flow safety in prepareGit: (1) a failed status read blocks
+// BEFORE any add/commit/checkout (the C1 typed error must propagate, never be
+// swallowed into "no modified files"); (2) a valid-repo snapshot without
+// records fails closed instead of being masked into an empty baseline by the
+// old `?? []`; (3) the restore list covers modified / untracked / removed /
+// renamed (both paths) in a REAL repository, with .oae//.opencode/ excluded;
+// (4) the new-repo and no-commits paths keep working. Deterministic failures
+// via setGitExecForTest (always reset in finally); real git only in throwaway
+// temp repositories.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const { baselineRestoreListOrFail } = p02Git;
+
+test("C2/C3 prepareGit: a failed git status read blocks BEFORE any add/commit/checkout", async () => {
+  const failures: Array<{ label: string; code: number | null; timedOut: boolean; stdout: string; stderr: string }> = [
+    { label: "exit 128", code: 128, timedOut: false, stdout: "", stderr: "fatal: unable to read the index (simulated)" },
+    { label: "spawn failure (code null)", code: null, timedOut: false, stdout: "", stderr: "spawn git ENOENT (simulated)" },
+    { label: "timeout (code 0)", code: 0, timedOut: true, stdout: "", stderr: "" },
+    { label: "timeout + spawn failure", code: null, timedOut: true, stdout: "", stderr: "" },
+    { label: "exit 0, uninterpretable porcelain", code: 0, timedOut: false, stdout: "zz broken\0", stderr: "" },
+  ];
+  for (const f of failures) {
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git") {
+        // the probes inspectGit makes before reading status
+        if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") {
+          return Promise.resolve({ code: 0, stdout: "true\n", stderr: "", timedOut: false });
+        }
+        if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
+          return Promise.resolve({ code: 0, stdout: "main\n", stderr: "", timedOut: false });
+        }
+        if (args[0] === "remote") {
+          return Promise.resolve({ code: 0, stdout: "https://example.com/oae-c2-probe.git\n", stderr: "", timedOut: false });
+        }
+        if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          return Promise.resolve({ code: 0, stdout: `${"b".repeat(40)}\n`, stderr: "", timedOut: false });
+        }
+        if (args[0] === "status") {
+          return Promise.resolve({ code: f.code, stdout: f.stdout, stderr: f.stderr, timedOut: f.timedOut });
+        }
+      }
+      return Promise.reject(new Error(`C2 stub: unexpected git invocation: ${cmd} ${args.join(" ")}`));
+    });
+    let captured: unknown;
+    try {
+      await assert.rejects(
+        () => prepareGit("/oae-c2-probe/not-a-real-dir"),
+        (e: unknown) => { captured = e; return e instanceof GitStatusReadError; },
+        `git status ${f.label} must block prepareGit (fail-closed)`,
+      );
+    } finally {
+      setGitExecForTest(); // never leak the stub
+    }
+    assert.ok(captured instanceof GitStatusReadError, `${f.label}: typed GitStatusReadError`);
+    assert.match((captured as Error).message, /fail-closed/, `${f.label}: fail-closed diagnosis`);
+    assert.ok((captured as Error).message.length <= 500, `${f.label}: self-limiting message`);
+    assert.ok(!calls.some((a) => a[0] === "add"), `${f.label}: git add must never run after a failed status read`);
+    assert.ok(!calls.some((a) => a[0] === "commit"), `${f.label}: git commit must never run after a failed status read`);
+    assert.ok(!calls.some((a) => a[0] === "checkout"), `${f.label}: no branch switch after a failed status read`);
+    assert.ok(!calls.some((a) => a[0] === "init"), `${f.label}: no repo init after a failed status read`);
+  }
+});
+
+test("C2/C3 guard: a valid-repo snapshot without records fails closed; with records it derives the full list", () => {
+  // synthetic status matching the GitStatus contract but WITHOUT records —
+  // exactly the case the old `st.records ?? []` silently turned into an
+  // empty baseline inside prepareGit.
+  const broken: GitStatus = { isRepo: true, branch: "main", remote: null, uncommitted: [" M tracked.txt"], hasCommits: true };
+  assert.throws(
+    () => baselineRestoreListOrFail(broken),
+    (e: unknown) =>
+      e instanceof GitStatusReadError &&
+      /no structured records/.test(e.message) &&
+      /fail-closed/.test(e.message) &&
+      e.message.length <= 500,
+    "missing records on a valid repo must throw, never become an empty baseline",
+  );
+  // the same snapshot WITH records still derives the complete list, rename
+  // pairs contributing both sides (contract preserved by the checked wrapper)
+  const ok = baselineRestoreListOrFail({
+    isRepo: true,
+    branch: "main",
+    remote: null,
+    uncommitted: [],
+    hasCommits: true,
+    records: [
+      { x: " ", y: "M", path: "mod.txt" },
+      { x: "R", y: " ", path: "new.txt", orig: "old.txt" },
+      { x: "?", y: "?", path: ".oae/state.json" },
+    ],
+  });
+  assert.deepEqual(
+    [...ok].sort(),
+    ["mod.txt", "new.txt", "old.txt"],
+    "checked wrapper keeps baselineRestoreList semantics (both rename paths, internal trees excluded)",
+  );
+});
+
+test("C2/C3 baseline: real mixed worktree — modified, untracked, removed, rename (both paths); internal trees excluded", async () => {
+  const dir = await makeProject();
+  try {
+    gRun(dir, ["init", "-b", "main"]);
+    await writeFile(join(dir, "tracked.txt"), "original\n");
+    await writeFile(join(dir, "toremove.txt"), "will be removed\n");
+    await writeFile(join(dir, "tomove.txt"), "moving along\n");
+    gStage(dir, "tracked.txt", "toremove.txt", "tomove.txt");
+    gBaseCommit(dir);
+    assert.equal(gStagedSnapshot(dir), "", "fixture starts clean");
+
+    // mixed user state (all at once, like a real mid-run project)
+    await writeFile(join(dir, "tracked.txt"), "user edit\n");            //  M tracked.txt
+    await writeFile(join(dir, "new-untracked.txt"), "fresh file\n");     // ?? new-untracked.txt
+    await rm(join(dir, "toremove.txt"));                                  //  D toremove.txt (real tracked removal)
+    gRun(dir, ["mv", "tomove.txt", "moved.txt"]);                         // R  moved.txt / tomove.txt (staged rename)
+    await mkdir(join(dir, ".oae"), { recursive: true });                  // ?? .oae/ (internal — must be excluded)
+    await writeFile(join(dir, ".oae", "state.json"), "internal\n");
+    await mkdir(join(dir, ".opencode"), { recursive: true });             // ?? .opencode/ (internal — must be excluded)
+    await writeFile(join(dir, ".opencode", "x.md"), "internal\n");
+    await writeFile(join(dir, ".oae-notes"), "user work\n");              // look-alike is USER work (stays listed)
+
+    const fixture = gStagedSnapshot(dir);
+    assert.ok(
+      fixture.includes(" M tracked.txt\0") && fixture.includes("?? new-untracked.txt\0") &&
+      fixture.includes(" D toremove.txt\0") && fixture.includes("R  moved.txt\0tomove.txt\0"),
+      `fixture must be the documented mixed state, got: ${JSON.stringify(fixture)}`,
+    );
+
+    const prep = await prepareGit(dir);
+    const got = [...prep.baselineUncommitted].sort();
+    assert.deepEqual(got, [
+      ".oae-notes",         // look-alike: user work, kept (policy §6.3)
+      "moved.txt",          // rename destination
+      "new-untracked.txt",  // untracked new file
+      "tomove.txt",         // rename origin (lexically before toremove.txt)
+      "toremove.txt",       // removed tracked file
+      "tracked.txt",        // modified tracked file
+    ], "baseline covers EXACTLY the mixed user state (both rename sides, no internal trees)");
+    assert.ok(!got.some((p) => isInternalArtifactPath(p)), ".oae/ and .opencode/ are excluded from the baseline");
+    assert.ok(prep.status.uncommitted.includes("R  tomove.txt -> moved.txt"), "derived text keeps the orig -> path rename form");
+    assert.ok(prep.branch?.startsWith("oae/auto-"), "run branch created");
+    assert.ok(prep.baseline && /^[0-9a-f]{40}$/.test(prep.baseline), "baseline HEAD captured");
+    // prepareGit preserved the user's work: it committed NOTHING and left the
+    // mixed state in the worktree/index untouched
+    assert.equal(gCommitCount(dir), 1, "prepareGit must not commit user work");
+    assert.equal(await readFile(join(dir, "tracked.txt"), "utf8"), "user edit\n");
+    assert.equal(await readFile(join(dir, "moved.txt"), "utf8"), "moving along\n");
+    await assert.rejects(() => readFile(join(dir, "tomove.txt"), "utf8"), "worktree reality untouched (rename stays moved)");
+    await assert.rejects(() => readFile(join(dir, "toremove.txt"), "utf8"), "worktree reality untouched (removal stays removed)");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C2/C3 no-commit paths: prepareGit on a fresh/non-repo directory never throws and yields an empty baseline", async () => {
+  // isRepo:false → init → baseline commit → fresh inspectGit: empty by construction
+  const dir1 = await makeProject();
+  try {
+    await writeFile(join(dir1, "user.txt"), "user work\n");
+    const prep = await prepareGit(dir1);
+    assert.ok(prep.status.isRepo && prep.status.hasCommits, "repo initialized and baseline committed");
+    assert.deepEqual(prep.baselineUncommitted, [], "fresh-repo baseline is empty by construction (nothing to restore)");
+    assert.ok(prep.branch?.startsWith("oae/auto-"), "run branch created on the fresh repo");
+  } finally { await rm(dir1, { recursive: true, force: true }); }
+  // repo without commits → same construction: baseline commit, empty list, no throw
+  const dir2 = await makeProject();
+  try {
+    gRun(dir2, ["init", "-b", "main"]);
+    await writeFile(join(dir2, "user.txt"), "user work\n");
+    const prep = await prepareGit(dir2);
+    assert.ok(prep.status.hasCommits, "baseline commit created on the unborn branch");
+    assert.deepEqual(prep.baselineUncommitted, [], "no stale restore list after the baseline commit");
+    assert.ok(prep.branch?.startsWith("oae/auto-"), "run branch created on the no-commits repo");
+  } finally { await rm(dir2, { recursive: true, force: true }); }
+});
+
+// ── C4 — baseline pathspecs must be interpreted LITERALLY by git ─────────────
+// `--` only separates options from pathspecs; a bare path is still re-parsed
+// as a glob, so `a[1].txt` matches BOTH `a[1].txt` and `a1.txt`. The fix
+// prefixes every path with the `:(literal)` pathspec magic. These tests run
+// against REAL git in throwaway repositories and would fail with the bug:
+// with the bare pathspec, the bracket path would demote its glob sibling out
+// of the index and the sibling's staged change would silently miss the commit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Seed a C4 repo: main branch, one base commit containing the given files. */
+async function c4Seed(dir: string, files: Record<string, string>): Promise<void> {
+  gRun(dir, ["init", "-b", "main"]);
+  for (const [name, content] of Object.entries(files)) {
+    await writeFile(join(dir, name), content);
+  }
+  gRun(dir, ["add", "-A"]); // no pathspecs: a leading-':' file name is only addable without magic re-parsing
+  gBaseCommit(dir);
+  assert.equal(gStagedSnapshot(dir), "", "C4 fixture must start clean");
+}
+
+test("C4 collision: baseline 'a[1].txt' is restored literally and never demotes or commits its glob sibling 'a1.txt'", async () => {
+  const dir = await makeProject();
+  try {
+    // both siblings committed with distinct contents, BOTH modified later:
+    // the baseline list covers both, so the restore must demote exactly those
+    // two index entries — no more (nothing else was ever staged), no less.
+    await c4Seed(dir, { "a[1].txt": "bracket base\n", "a1.txt": "sibling base\n" });
+    await writeFile(join(dir, "a[1].txt"), "bracket baseline edit\n");
+    await writeFile(join(dir, "a1.txt"), "sibling baseline edit\n");
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("a[1].txt") && prep.baselineUncommitted.includes("a1.txt"),
+      "baseline contains BOTH literal paths (the -z capture is verbatim)");
+    assert.ok(prep.branch?.startsWith("oae/auto-"), "run branch created");
+
+    // task work happens AFTER prepareGit (like a real run)
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+
+    const c = await commitAll(dir, "oae(c4-1): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore must succeed, got: ${c.error}`);
+    assert.ok(c.commit && /^[0-9a-f]{40}$/.test(c.commit), "task commit created");
+
+    // the task commit contains NO version of any baseline file
+    const committed = gRun(dir, ["diff", "--name-only", "HEAD^", "HEAD"]).trim().split("\n").sort();
+    assert.deepEqual(committed, ["feature.txt"], "task commit carries ONLY the task file — bracket glob must not drag 'a1.txt' baseline work in");
+
+    // baseline work stays in the worktree (restore --staged never touches it)
+    assert.equal(await readFile(join(dir, "a[1].txt"), "utf8"), "bracket baseline edit\n", "bracket file content preserved");
+    assert.equal(await readFile(join(dir, "a1.txt"), "utf8"), "sibling baseline edit\n", "sibling content preserved (not reverted by any restore)");
+
+    // status is EXACTLY the expected shape: both baseline files still modified
+    // (unstaged — demoted out of the index), nothing staged, task file gone
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes(" M a[1].txt\0"), "bracket path remains modified-unstaged (baseline demoted correctly)");
+    assert.ok(snap.includes(" M a1.txt\0"), "sibling remains modified-unstaged (demoted as its own baseline entry)");
+    assert.ok(!snap.includes("feature.txt"), "task file was committed, no residue");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C4 decisive collision: sibling 'a1.txt' modified BY THE TASK stays staged and committed — the 'a[1].txt' baseline pathspec must not touch it", async () => {
+  // This is the variant that FAILS with the bug: with a bare 'a[1].txt'
+  // pathspec, git restores the whole glob set {a[1].txt, a1.txt}, demoting the
+  // task's staged 'a1.txt' change out of the index, so the commit would lose
+  // the task's work. The literal pathspec must demote ONLY the bracket file.
+  const dir = await makeProject();
+  try {
+    await c4Seed(dir, { "a[1].txt": "bracket base\n", "a1.txt": "sibling base\n" });
+    // baseline work BEFORE prepareGit: only the bracket file is user-dirty
+    await writeFile(join(dir, "a[1].txt"), "bracket baseline edit\n");
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("a[1].txt"), "bracket path is baseline");
+    assert.ok(!prep.baselineUncommitted.includes("a1.txt"), "clean sibling is NOT baseline yet (task will touch it)");
+
+    // task work AFTER prepareGit: modify the sibling + add a task file
+    await writeFile(join(dir, "a1.txt"), "sibling task edit\n");
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+
+    const c = await commitAll(dir, "oae(c4-2): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore must succeed, got: ${c.error}`);
+
+    // THE decisive assertion: the task's sibling change reached the commit.
+    // With the bug, the glob demotes 'a1.txt' from the index and the commit
+    // would contain only feature.txt.
+    const committed = gRun(dir, ["diff", "--name-only", "HEAD^", "HEAD"]).trim().split("\n").sort();
+    assert.deepEqual(committed, ["a1.txt", "feature.txt"], "task's sibling edit and task file are committed; baseline bracket file is not");
+
+    // and the bracket baseline stays modified in the worktree, out of the commit
+    assert.equal(await readFile(join(dir, "a[1].txt"), "utf8"), "bracket baseline edit\n", "bracket baseline content preserved in the worktree");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes(" M a[1].txt\0"), "only the bracket path remains modified-unstaged");
+    assert.ok(!snap.includes("a1.txt") && !snap.includes("feature.txt"), "committed task work left no residue");
+    assert.ok(!committed.includes("a[1].txt"), "bracket baseline never entered the task commit");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C4 special names: spaces, unicode, brackets AND a leading-colon file name are restored literally", async () => {
+  // A file name that itself starts with ':' could look like pathspec magic
+  // (short-hand exclude ':!x', top magic ':(top)'). With the `:(literal)`
+  // prefix the remainder is taken verbatim (verified on git 2.43), so such
+  // names are safe baseline entries too.
+  const dir = await makeProject();
+  try {
+    await c4Seed(dir, {
+      "arq [1] ção.txt": "unicode base\n", // spaces + brackets + unicode
+      ":weird": "colon base\n",            // leading colon (short-hand magic look-alike)
+    });
+    await writeFile(join(dir, "arq [1] ção.txt"), "unicode baseline edit\n");
+    await writeFile(join(dir, ":weird"), "colon baseline edit\n");
+
+    const prep = await prepareGit(dir);
+    assert.ok(prep.baselineUncommitted.includes("arq [1] ção.txt"), "spaces+unicode+brackets arrive literal on the restore list");
+    assert.ok(prep.baselineUncommitted.includes(":weird"), "leading-colon name arrives literal on the restore list");
+
+    // task work happens AFTER prepareGit (like a real run)
+    await writeFile(join(dir, "feature.txt"), "task work\n");
+
+    const c = await commitAll(dir, "oae(c4-3): change code", prep.baselineUncommitted);
+    assert.ok(!c.error, `restore must succeed for special names, got: ${c.error}`);
+
+    const committed = gRun(dir, ["diff", "--name-only", "HEAD^", "HEAD"]).trim().split("\n").sort();
+    assert.deepEqual(committed, ["feature.txt"], "no special-name baseline file entered the task commit");
+
+    assert.equal(await readFile(join(dir, "arq [1] ção.txt"), "utf8"), "unicode baseline edit\n", "unicode content preserved");
+    assert.equal(await readFile(join(dir, ":weird"), "utf8"), "colon baseline edit\n", "colon-name content preserved");
+    const snap = gStagedSnapshot(dir);
+    assert.ok(snap.includes(" M arq [1] ção.txt\0"), "unicode path remains modified-unstaged");
+    assert.ok(snap.includes(" M :weird\0"), "colon-name path remains modified-unstaged");
+    assert.ok(!snap.includes("feature.txt"), "task file was committed, no residue");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C5 — stageAll / restoreBaseline must treat runCommand's `code: number | null`
+// correctly: a null code (spawn/initialization failure) and a timeout are
+// modalities DISTINCT from a non-zero exit, none of them may ever be read as a
+// successful staging/restore, and the typed errors name the right cause.
+// Stub pattern copied from the P0.2.1 A3 tests: a real throwaway repository,
+// the module-level seam (setGitExecForTest) intercepting ONLY the command
+// under test and delegating everything else to the real runCommand; the stub
+// is always reset in finally.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C5 — `code as number` masking: runCommand returns code: number|null, where
+// null means the git process could not be started (spawn failure) — casting
+// that to number lied in the diagnostic and erased the distinction between
+// (a) spawn/initialization failure, (b) non-zero exit and (c) timeout. These
+// tests drive stageAll/restoreBaseline through commitAll (the same pattern as
+// the P0.2.1 A3 tests above: real throwaway repos + the module-level seam,
+// every stub reset in a finally; the guards upstream use rev-parse/status, so
+// a failure stub keyed on args[0] === "add" / "restore" cannot be tripped by
+// them) and assert each modality renders its own diagnosis.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Seed the same fixture the P0.2.1 A3 test uses: clean base + baseline work + task work. */
+async function c5Seed(dir: string): Promise<Awaited<ReturnType<typeof prepareGit>>> {
+  gRun(dir, ["init", "-b", "main"]);
+  await writeFile(join(dir, "tracked.txt"), "original\n");
+  gStage(dir, "tracked.txt");
+  gBaseCommit(dir);
+  await writeFile(join(dir, "untracked.txt"), "user untracked\n");
+  await writeFile(join(dir, "staged-user.txt"), "user work\n");
+  gStage(dir, "staged-user.txt");
+  const prep = await prepareGit(dir);
+  assert.ok(prep.baselineUncommitted.includes("staged-user.txt") && prep.baselineUncommitted.includes("untracked.txt"),
+    "fixture: baseline work on the restore list");
+  await writeFile(join(dir, "feature.txt"), "task work\n");
+  return prep;
+}
+
+test("C5 typed errors: null code is preserved and rendered as an initialization failure, never a numeric exit", () => {
+  const st = new GitStagingError(null, "spawn git ENOENT (simulated)", false);
+  assert.equal(st.code, null, "GitStagingError.code keeps null (no cast masking)");
+  assert.match(st.message, /exit unknown — git process could not be started/);
+  assert.doesNotMatch(st.message, /exit \d/);
+  const stT = new GitStagingError(null, "", true);
+  assert.match(stT.message, /exit unknown, timed out/);
+  const st1 = new GitStagingError(1, "fatal: something (simulated)", false);
+  assert.equal(st1.code, 1);
+  assert.match(st1.message, /exit 1\)/, "numeric exit rendering unchanged for real exit codes");
+  assert.doesNotMatch(st1.message, /could not be started/);
+  const stTo = new GitStagingError(0, "", true);
+  assert.match(stTo.message, /exit 0, timed out/, "timeout is stated even when the exit code was 0");
+  const br = new GitBaselineRestoreError(["x"], null, "spawn git ENOENT (simulated)", "");
+  assert.equal(br.code, null, "GitBaselineRestoreError.code keeps null");
+  assert.match(br.message, /exit unknown — git process could not be started/);
+  const brT = new GitBaselineRestoreError(["x"], 0, "", "", true);
+  assert.equal(brT.timedOut, true, "timedOut flag carried on the typed restore error");
+  assert.match(brT.message, /exit 0, timed out/);
+});
+
+test("C5 stageAll: git add exit 1 → commitAll returns the typed diagnosis and runs neither restore nor commit", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    const before = gStagedSnapshot(dir);
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git" && args[0] === "add") {
+        return Promise.resolve({ code: 1, stdout: "", stderr: "fatal: unable to write index (simulated)", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-1): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a staging failure");
+    assert.match(c.error!, /staging failed \(git add, exit 1\)/);
+    assert.match(c.error!, /unable to write index/);
+    assert.equal(calls.filter((a) => a[0] === "restore").length, 0, "restore was NOT attempted after staging failed");
+    assert.equal(calls.filter((a) => a.includes("commit")).length, 0, "the commit command was NOT attempted");
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+    assert.equal(gStagedSnapshot(dir), before, "index untouched by the failed staging attempt");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 stageAll: git add code null (spawn failure) → initialization-failure diagnosis, distinct from a non-zero exit", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git" && args[0] === "add") {
+        return Promise.resolve({ code: null, stdout: "", stderr: "spawn git ENOENT (simulated)", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-2): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a staging spawn failure");
+    assert.match(c.error!, /exit unknown — git process could not be started/, "spawn failure gets its own phrase");
+    assert.doesNotMatch(c.error!, /exit \d/, "a null code is never rendered as a numeric exit");
+    assert.equal(calls.filter((a) => a[0] === "restore").length, 0, "no restore after staging fails to start");
+    assert.equal(calls.filter((a) => a.includes("commit")).length, 0, "no commit command attempted");
+    assert.equal(gCommitCount(dir), 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 stageAll: git add timedOut → 'timed out' diagnosis (timeout with a null exit code)", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "add") {
+        return Promise.resolve({ code: null, stdout: "", stderr: "", timedOut: true });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-3): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a staging timeout");
+    assert.match(c.error!, /staging failed \(git add, exit unknown, timed out\)/);
+    assert.match(c.error!, /timed out/);
+    assert.doesNotMatch(c.error!, /could not be started/, "a timeout is not misreported as a spawn failure");
+    assert.equal(gCommitCount(dir), 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 stageAll: git add timedOut with exit 124 → timeout diagnosis (non-zero code variant)", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "add") {
+        return Promise.resolve({ code: 124, stdout: "", stderr: "", timedOut: true });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-3b): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a staging timeout");
+    assert.match(c.error!, /staging failed \(git add, exit 124, timed out\)/);
+    assert.doesNotMatch(c.error!, /could not be started/, "a timeout is not misreported as a spawn failure");
+    assert.equal(gCommitCount(dir), 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 restoreBaseline: git restore --staged code null → typed restore failure, commit NOT executed", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      if (cmd === "git" && args[0] === "restore") {
+        return Promise.resolve({ code: null, stdout: "", stderr: "spawn git ENOENT (simulated)", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-4): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a restore spawn failure");
+    assert.match(c.error!, /baseline restore failed \(git restore --staged, exit unknown — git process could not be started\)/);
+    assert.doesNotMatch(c.error!, /exit \d/, "null code never rendered as a numeric exit");
+    assert.match(c.error!, /staged-user\.txt/, "the baseline path is named in the diagnostic");
+    assert.equal(calls.filter((a) => a.includes("commit")).length, 0, "the commit command was NOT attempted after the restore failed");
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 restoreBaseline: git restore --staged timedOut with exit 124 → timeout diagnosis (non-zero code variant)", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "restore") {
+        return Promise.resolve({ code: 124, stdout: "", stderr: "", timedOut: true });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-5b): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a restore timeout");
+    assert.match(c.error!, /baseline restore failed \(git restore --staged, exit 124, timed out\)/);
+    assert.doesNotMatch(c.error!, /could not be started/, "a timeout is not misreported as a spawn failure");
+    assert.equal(gCommitCount(dir), 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 restoreBaseline: git restore --staged timedOut → 'timed out' diagnosis, commit NOT executed", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      if (cmd === "git" && args[0] === "restore") {
+        return Promise.resolve({ code: null, stdout: "", stderr: "", timedOut: true });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-5): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a restore timeout");
+    assert.match(c.error!, /baseline restore failed \(git restore --staged, exit unknown, timed out\)/);
+    assert.match(c.error!, /timed out/);
+    assert.doesNotMatch(c.error!, /could not be started/, "a timeout is not misreported as a spawn failure");
+    assert.equal(gCommitCount(dir), 1, "no commit was created");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5 happy path: successful add + successful restore still reaches the commit (pass-through seam)", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    const calls: string[][] = [];
+    setGitExecForTest((cmd, args, opts) => {
+      calls.push([...args]);
+      return runCommand(cmd, args, opts); // pass-through: real behavior, recorded
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-6): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.error, `no error on the happy path, got: ${c.error}`);
+    assert.ok(c.commit && /^[0-9a-f]{40}$/.test(c.commit), "the task commit was created");
+    assert.ok(calls.some((a) => a[0] === "add"), "git add ran");
+    assert.equal(calls.filter((a) => a[0] === "restore").length, 1, "exactly one restore invocation ran");
+    assert.ok(calls.some((a) => a.includes("commit")), "the commit command ran");
+    const committed = gRun(dir, ["show", "--name-only", "--format=", "HEAD"]);
+    assert.ok(committed.includes("feature.txt"), "task work committed");
+    assert.ok(!committed.includes("staged-user.txt") && !committed.includes("untracked.txt"), "baseline work stayed out");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5/P4: git commit with code null reports an initialization failure (never 'exited with code null')", async () => {
+  const dir = await makeProject();
+  try {
+    const prep = await c5Seed(dir);
+    setGitExecForTest((cmd, args, opts) => {
+      // the commit invocation is `git -c user.name=… -c user.email=… commit -m …`,
+      // so the dispatch must key on the argument list, not on args[0]
+      if (cmd === "git" && args.includes("commit")) {
+        // no captured output at all: the fallback phrase (P4) must name the
+        // initialization failure instead of "exited with code null"
+        return Promise.resolve({ code: null, stdout: "", stderr: "", timedOut: false });
+      }
+      return runCommand(cmd, args, opts);
+    });
+    let c: Awaited<ReturnType<typeof commitAll>>;
+    try {
+      c = await commitAll(dir, "oae(c5-7): change code", prep.baselineUncommitted);
+    } finally {
+      setGitExecForTest();
+    }
+    assert.ok(!c.commit, "no commit after a failed commit invocation");
+    assert.match(c.error!, /git commit could not be started \(no exit code\)/);
+    assert.doesNotMatch(c.error!, /exited with code/, "a null code is never rendered as a numeric exit");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
